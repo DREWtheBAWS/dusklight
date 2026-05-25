@@ -14,6 +14,13 @@ void GeometryCollector::on_capture(const AuroraGxCaptureDraw* draw, void* userda
 
 void GeometryCollector::process_draw(const AuroraGxCaptureDraw* draw) {
     if (draw->indexCount == 0 || m_triangles.size() >= kMaxTriangles) return;
+
+    // Filter: reject orthographic draws (UI, shadow maps) and draws on small
+    // render targets (thumbnail/shadow-map perspective passes).
+    if (m_perspectiveOnly && draw->projType != 0) return;  // 0 = GX_PERSPECTIVE
+    if (m_minViewportW > 0.f && draw->viewportWidth  < m_minViewportW) return;
+    if (m_minViewportH > 0.f && draw->viewportHeight < m_minViewportH) return;
+
     ++m_drawCallCount;
     auto tris = decode_triangles(*draw);
     for (auto& t : tris) {

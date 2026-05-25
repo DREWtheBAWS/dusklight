@@ -28,6 +28,16 @@ public:
     Stats          last_stats()       const { return m_lastStats; }
     const std::string& last_dump_message() const { return m_lastDumpMsg; }
 
+    // Filter: only collect perspective draws whose viewport meets minimum dimensions.
+    // Defaults keep UI, HUD, and small shadow-map passes out of the capture.
+    // Pass 0,0 to disable viewport filtering; set perspectiveOnly=false to also
+    // capture orthographic draws.
+    void set_filter(bool perspectiveOnly, float minViewportW = 320.f, float minViewportH = 240.f) {
+        m_perspectiveOnly  = perspectiveOnly;
+        m_minViewportW     = minViewportW;
+        m_minViewportH     = minViewportH;
+    }
+
     // Drives the callback directly — used by unit tests and simulate_draw.
     void simulate_draw(const AuroraGxCaptureDraw& draw);
 
@@ -42,6 +52,10 @@ private:
     Stats       m_lastStats;
     std::string m_pendingDumpPath;
     std::string m_lastDumpMsg;
+
+    bool  m_perspectiveOnly = true;
+    float m_minViewportW    = 320.f;
+    float m_minViewportH    = 240.f;
 
     static constexpr uint32_t kMaxTriangles = 500'000;
 };

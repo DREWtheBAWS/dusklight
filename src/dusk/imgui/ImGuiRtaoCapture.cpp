@@ -20,6 +20,23 @@ void ImGuiMenuTools::ShowRtaoCaptureWindow() {
 
     ImGui::Separator();
 
+    // Filter controls
+    static bool s_perspOnly = true;
+    static float s_minW = 320.f, s_minH = 240.f;
+    bool filterChanged = false;
+    filterChanged |= ImGui::Checkbox("Perspective only", &s_perspOnly);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(80.f);
+    filterChanged |= ImGui::InputFloat("Min W", &s_minW, 0.f, 0.f, "%.0f");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(80.f);
+    filterChanged |= ImGui::InputFloat("Min H", &s_minH, 0.f, 0.f, "%.0f");
+    if (filterChanged) {
+        m_collector.set_filter(s_perspOnly, s_minW, s_minH);
+    }
+
+    ImGui::Separator();
+
     // Derive a default dump path next to the executable
     static std::string s_dumpPath;
     if (s_dumpPath.empty()) {

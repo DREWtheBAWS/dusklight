@@ -43,8 +43,11 @@ static AuroraGxCaptureDraw make_triangle_draw(std::vector<uint8_t>& verts,
     d.currentPnMtx = 0;
     // identity matrix
     d.pnMtx[0][0][0] = 1.f; d.pnMtx[0][1][1] = 1.f; d.pnMtx[0][2][2] = 1.f;
-    d.indices     = indices.data();
-    d.indexCount  = 3;
+    d.indices        = indices.data();
+    d.indexCount     = 3;
+    d.projType       = 0;    // GX_PERSPECTIVE
+    d.viewportWidth  = 640.f;
+    d.viewportHeight = 480.f;
     return d;
 }
 
@@ -133,6 +136,7 @@ TEST_CASE("GeometryCollector: OBJ dump produces valid vertex and face lines") {
         d.currentPnMtx = 0;
         d.pnMtx[0][0][0] = 1.f; d.pnMtx[0][1][1] = 1.f; d.pnMtx[0][2][2] = 1.f;
         d.indices = idx.data(); d.indexCount = 6;
+        d.projType = 0; d.viewportWidth = 640.f; d.viewportHeight = 480.f;
         return d;
     };
     gc.simulate_draw(draw2());
