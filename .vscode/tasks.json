@@ -1,51 +1,45 @@
 {
-  // Use Ctrl+Shift+B to run build tasks.
-  // Or "Run Build Task" in the Command Palette.
   "version": "2.0.0",
-  "inputs": [
-    {
-        "id": "gameVersion",
-        "type": "pickString",
-        "options": [
-            "GZ2E01",    // GCN USA
-            "GZ2P01",    // GCN PAL
-            "GZ2J01",    // GCN JPN
-            "RZDE01_00", // Wii USA Rev 0
-            "RZDE01_02", // Wii USA Rev 2
-            "RZDP01",    // Wii PAL
-            "RZDJ01",    // Wii JPN
-            //"RZDK01",    // Wii KOR
-            //"DZDE01",    // Wii USA Kiosk Demo
-            //"DZDP01",    // Wii PAL Kiosk Demo
-            "Shield",    // Shield
-            //"ShieldP",   // Shield Production
-            "ShieldD",   // Shield Debug
-        ],
-        "default": "GZ2E01",
-        "description": "Game version to build."
-    },
-  ],
+  "windows": {
+    "options": {
+      "shell": {
+        "executable": "cmd.exe",
+        "args": ["/c"]
+      }
+    }
+  },
   "tasks": [
     {
-      "label": "ninja",
+      "label": "CMake: Configure (Debug)",
       "type": "shell",
-      "command": "ninja",
+      "command": "platforms\\windows\\msvc_build.bat configure debug",
+      "problemMatcher": ["$msCompile"],
+      "group": "build"
+    },
+    {
+      "label": "CMake: Build (Debug)",
+      "type": "shell",
+      "command": "platforms\\windows\\msvc_build.bat build debug",
+      "problemMatcher": ["$msCompile"],
       "group": {
         "kind": "build",
         "isDefault": true
-      }
+      },
+      "dependsOn": []
     },
     {
-      "label": "configure",
+      "label": "CMake: Configure (RelWithDebInfo)",
       "type": "shell",
-      "command": "${command:python.interpreterPath} configure.py --version ${input:gameVersion}",
-      "problemMatcher": [],
+      "command": "platforms\\windows\\msvc_build.bat configure relwithdebinfo",
+      "problemMatcher": ["$msCompile"],
+      "group": "build"
     },
     {
-      "label": "ninja changes_all",
+      "label": "CMake: Build (RelWithDebInfo)",
       "type": "shell",
-      "command": "ninja changes_all",
-      "problemMatcher": [],
-    },
+      "command": "platforms\\windows\\msvc_build.bat build relwithdebinfo",
+      "problemMatcher": ["$msCompile"],
+      "group": "build"
+    }
   ]
 }

@@ -91,7 +91,7 @@ namespace dusk {
 
     void ImGuiMenuTools::afterDraw() {
         std::lock_guard lock(StubLogMutex);
-
         ClearPastFrame();
+        m_collector.end_frame();
     }
 }

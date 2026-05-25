@@ -29,7 +29,9 @@ extern bool enableLodBias;
 }
 
 namespace dusk {
-    ImGuiMenuTools::ImGuiMenuTools() {}
+    ImGuiMenuTools::ImGuiMenuTools() {
+        m_collector.install();
+    }
 
     void ImGuiMenuTools::draw() {
         if (ImGui::BeginMenu("Tools")) {
@@ -105,6 +107,7 @@ namespace dusk {
             ImGui::MenuItem("Bloom", nullptr, &m_showBloomWindow);
             ImGui::MenuItem("Stub Log", nullptr, &m_showStubLog);
             ImGui::MenuItem("Actor Spawner", nullptr, &m_showActorSpawner);
+            ImGui::MenuItem("RTAO Capture", nullptr, &m_showRtaoCapture);
 
             if (!dusk::IsGameLaunched) {
                 ImGui::EndDisabled();

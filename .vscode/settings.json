@@ -1,5 +1,5 @@
 {
-  "cmake.buildDirectory": "${workspaceFolder}/build/dusklight/${buildType}/${variant:tp_version}",
+  "cmake.useCMakePresets": "always",
   "cmake.generator": "Ninja",
   "cmake.configureSettings": {
     "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
@@ -57,4 +57,11 @@
       // "--log=verbose",
   ],
   "clangd.detectExtensionConflicts": true,
+  "terminal.integrated.profiles.windows": {
+    "Developer Command Prompt (VS 2019)": {
+      "path": "cmd.exe",
+      "args": ["/k", "C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\BuildTools\\Common7\\Tools\\VsDevCmd.bat"]
+    }
+  },
+  "terminal.integrated.defaultProfile.windows": "Developer Command Prompt (VS 2019)",
 }

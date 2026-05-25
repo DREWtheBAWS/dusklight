@@ -116,6 +116,14 @@ endif ()
 set(AURORA_ENABLE_DVD ON CACHE BOOL "Enable DVD API support" FORCE)
 set(AURORA_ENABLE_CARD ON CACHE BOOL "Enable CARD API support" FORCE)
 set(AURORA_ENABLE_RMLUI ON CACHE BOOL "Enable RmlUi UI support" FORCE)
+# Pre-declare Freetype before aurora processes it — files.twilitrealm.dev is down.
+# FetchContent uses the first declaration, so this overrides aurora's broken URL.
+include(FetchContent)
+FetchContent_Declare(Freetype
+  URL https://github.com/freetype/freetype/archive/refs/tags/VER-2-14-3.tar.gz
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+  EXCLUDE_FROM_ALL
+)
 add_subdirectory(extern/aurora EXCLUDE_FROM_ALL)
 target_compile_definitions(aurora_mtx PRIVATE MTX_USE_PS=1)
 
@@ -249,6 +257,13 @@ FetchContent_Declare(json
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 FetchContent_MakeAvailable(cxxopts json)
+
+message(STATUS "dusklight: Fetching Catch2")
+FetchContent_Declare(Catch2
+    URL https://github.com/catchorg/Catch2/archive/refs/tags/v3.7.1.tar.gz
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+)
+FetchContent_MakeAvailable(Catch2)
 
 if (DUSK_ENABLE_SENTRY_NATIVE)
     message(STATUS "dusklight: Fetching sentry-native")
@@ -446,7 +461,12 @@ if (CMAKE_CXX_LINK_GROUP_USING_RESCAN_SUPPORTED OR CMAKE_LINK_GROUP_USING_RESCAN
     set(JSYSTEM_LINK_LIBRARIES "$<LINK_GROUP:RESCAN,${JSYSTEM_LIBRARIES}>")
 endif ()
 
-set(DUSK_FILES src/dusk/main.cpp ${GAME_BASE_FILES} ${GAME_DEBUG_FILES})
+set(DUSK_FILES src/dusk/main.cpp ${GAME_BASE_FILES} ${GAME_DEBUG_FILES}
+    src/dusk/rtao/vertex_decoder.cpp
+    src/dusk/rtao/geometry_collector.cpp
+    src/dusk/rtao/geometry_collector_aurora.cpp
+    src/dusk/imgui/ImGuiRtaoCapture.cpp
+)
 if(ANDROID)
     add_library(dusklight SHARED ${DUSK_FILES})
     set_target_properties(dusklight PROPERTIES OUTPUT_NAME main)
@@ -665,3 +685,21 @@ foreach (target IN LISTS BINARY_TARGETS)
         endif ()
     endforeach ()
 endforeach ()
+
+# --- RTAO unit tests -------------------------------------------------------
+add_executable(dusklight_rtao_tests
+    src/dusk/rtao/vertex_decoder.cpp
+    src/dusk/rtao/vertex_decoder_test.cpp
+    src/dusk/rtao/geometry_collector.cpp
+    src/dusk/rtao/geometry_collector_test.cpp
+)
+target_include_directories(dusklight_rtao_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/extern/aurora/include
+)
+target_compile_features(dusklight_rtao_tests PRIVATE cxx_std_20)
+target_link_libraries(dusklight_rtao_tests PRIVATE Catch2::Catch2WithMain)
+
+include(CTest)
+include(Catch)
+catch_discover_tests(dusklight_rtao_tests)

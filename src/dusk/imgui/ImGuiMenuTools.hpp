@@ -8,6 +8,7 @@
 #include "imgui.h"
 #include "ImGuiSaveEditor.hpp"
 #include "ImGuiStateShare.hpp"
+#include "dusk/rtao/geometry_collector.hpp"
 
 namespace dusk {
     class ImGuiMenuTools {
@@ -28,6 +29,7 @@ namespace dusk {
         void ShowStateShare();
         void ShowInputViewer();
         void ShowActorSpawner();
+        void ShowRtaoCaptureWindow();
 
     private:
 		bool m_showDebugOverlay = false;
@@ -58,6 +60,9 @@ namespace dusk {
         bool m_showActorSpawner = false;
         int m_inputOverlayCorner = 3;
         std::string m_controllerName;
+
+        bool m_showRtaoCapture = false;
+        dusk::rtao::GeometryCollector m_collector;
     };
 }
 
