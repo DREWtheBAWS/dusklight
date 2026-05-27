@@ -465,6 +465,7 @@ set(DUSK_FILES src/dusk/main.cpp ${GAME_BASE_FILES} ${GAME_DEBUG_FILES}
     src/dusk/rtao/vertex_decoder.cpp
     src/dusk/rtao/geometry_collector.cpp
     src/dusk/rtao/geometry_collector_aurora.cpp
+    src/dusk/rtao/bvh.cpp
     src/dusk/imgui/ImGuiRtaoCapture.cpp
 )
 if(ANDROID)
@@ -692,6 +693,8 @@ add_executable(dusklight_rtao_tests
     src/dusk/rtao/vertex_decoder_test.cpp
     src/dusk/rtao/geometry_collector.cpp
     src/dusk/rtao/geometry_collector_test.cpp
+    src/dusk/rtao/bvh.cpp
+    src/dusk/rtao/bvh_test.cpp
 )
 target_include_directories(dusklight_rtao_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src

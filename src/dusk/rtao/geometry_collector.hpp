@@ -1,4 +1,5 @@
 #pragma once
+#include "bvh.hpp"
 #include "vertex_decoder.hpp"
 #include <string>
 #include <vector>
@@ -14,6 +15,11 @@ public:
         uint32_t drawCallCount = 0;
     };
 
+    struct BvhStats {
+        uint32_t nodeCount = 0;
+        float    buildMs   = 0.f;
+    };
+
     // Call once at startup to register the Aurora capture callback.
     // Defined in geometry_collector_aurora.cpp (not linked into tests).
     void install();
@@ -25,8 +31,13 @@ public:
     // Request that the next end_frame() writes an OBJ to path.
     void request_dump(std::string path);
 
-    Stats          last_stats()       const { return m_lastStats; }
+    Stats              last_stats()        const { return m_lastStats; }
     const std::string& last_dump_message() const { return m_lastDumpMsg; }
+
+    // Triggers a BVH build from the current frame's geometry on the next end_frame().
+    // The result persists until the next build is requested.
+    void     request_bvh_build();
+    BvhStats last_bvh_stats() const { return m_lastBvhStats; }
 
     // Filter: only collect perspective draws whose viewport meets minimum dimensions.
     // Defaults keep UI, HUD, and small shadow-map passes out of the capture.
@@ -52,6 +63,10 @@ private:
     Stats       m_lastStats;
     std::string m_pendingDumpPath;
     std::string m_lastDumpMsg;
+
+    Bvh      m_bvh;
+    BvhStats m_lastBvhStats;
+    bool     m_pendingBvhBuild = false;
 
     bool  m_perspectiveOnly = true;
     float m_minViewportW    = 320.f;

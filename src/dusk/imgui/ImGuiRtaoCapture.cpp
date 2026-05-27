@@ -55,6 +55,19 @@ void ImGuiMenuTools::ShowRtaoCaptureWindow() {
         ImGui::TextWrapped("%s", msg.c_str());
     }
 
+    ImGui::Separator();
+
+    if (ImGui::Button("Build BVH")) {
+        m_collector.request_bvh_build();
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(captures current frame geometry)");
+
+    const auto bvhStats = m_collector.last_bvh_stats();
+    if (bvhStats.nodeCount > 0) {
+        ImGui::Text("BVH: %u nodes, %.2f ms", bvhStats.nodeCount, bvhStats.buildMs);
+    }
+
     ImGui::End();
 }
 

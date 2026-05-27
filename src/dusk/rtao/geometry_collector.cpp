@@ -1,5 +1,6 @@
 #include "geometry_collector.hpp"
 #include <aurora/geometry_capture.h>
+#include <chrono>
 #include <fstream>
 
 namespace dusk::rtao {
@@ -42,12 +43,27 @@ void GeometryCollector::end_frame() {
         m_pendingDumpPath.clear();
     }
 
+    if (m_pendingBvhBuild) {
+        const auto t0 = std::chrono::steady_clock::now();
+        m_bvh.build(m_triangles);
+        const auto t1 = std::chrono::steady_clock::now();
+        m_lastBvhStats = {
+            m_bvh.node_count(),
+            std::chrono::duration<float, std::milli>(t1 - t0).count(),
+        };
+        m_pendingBvhBuild = false;
+    }
+
     m_triangles.clear();
     m_drawCallCount = 0;
 }
 
 void GeometryCollector::request_dump(std::string path) {
     m_pendingDumpPath = std::move(path);
+}
+
+void GeometryCollector::request_bvh_build() {
+    m_pendingBvhBuild = true;
 }
 
 bool GeometryCollector::write_obj(const std::string& path) const {
