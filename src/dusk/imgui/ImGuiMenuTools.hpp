@@ -9,6 +9,7 @@
 #include "ImGuiSaveEditor.hpp"
 #include "ImGuiStateShare.hpp"
 #include "dusk/rtao/geometry_collector.hpp"
+#include "dusk/rtao/depth_viewer.hpp"
 
 namespace dusk {
     class ImGuiMenuTools {
@@ -63,6 +64,7 @@ namespace dusk {
 
         bool m_showRtaoCapture = false;
         dusk::rtao::GeometryCollector m_collector;
+        dusk::rtao::DepthTextureViewer m_depthViewer;
     };
 }
 

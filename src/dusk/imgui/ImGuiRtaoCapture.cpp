@@ -68,6 +68,18 @@ void ImGuiMenuTools::ShowRtaoCaptureWindow() {
         ImGui::Text("BVH: %u nodes, %.2f ms", bvhStats.nodeCount, bvhStats.buildMs);
     }
 
+    ImGui::Separator();
+    ImGui::Text("Depth Buffer");
+    if (m_depthViewer.is_ready()) {
+        // Scale to fit inside the window while keeping aspect ratio
+        const float avail = ImGui::GetContentRegionAvail().x;
+        const float aspect = static_cast<float>(m_depthViewer.width()) /
+                             static_cast<float>(m_depthViewer.height());
+        ImGui::Image(m_depthViewer.imgui_texture_id(), ImVec2(avail, avail / aspect));
+    } else {
+        ImGui::TextDisabled("(not yet available — start the game first)");
+    }
+
     ImGui::End();
 }
 

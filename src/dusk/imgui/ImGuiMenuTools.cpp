@@ -7,6 +7,7 @@
 #include "dusk/settings.h"
 #include "ImGuiConsole.hpp"
 #include "ImGuiMenuTools.hpp"
+#include <aurora/post_render.h>
 
 #include "ImGuiEngine.hpp"
 #include "d/actor/d_a_alink.h"
@@ -31,6 +32,9 @@ extern bool enableLodBias;
 namespace dusk {
     ImGuiMenuTools::ImGuiMenuTools() {
         m_collector.install();
+        aurora_set_post_render_callback([](WGPUDevice device, WGPUCommandEncoder encoder, void* userdata) {
+            static_cast<ImGuiMenuTools*>(userdata)->m_depthViewer.execute(device, encoder);
+        }, this);
     }
 
     void ImGuiMenuTools::draw() {
