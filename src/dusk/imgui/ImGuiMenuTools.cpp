@@ -33,7 +33,10 @@ namespace dusk {
     ImGuiMenuTools::ImGuiMenuTools() {
         m_collector.install();
         aurora_set_post_render_callback([](WGPUDevice device, WGPUCommandEncoder encoder, void* userdata) {
-            static_cast<ImGuiMenuTools*>(userdata)->m_depthViewer.execute(device, encoder);
+            auto* self = static_cast<ImGuiMenuTools*>(userdata);
+            self->m_depthViewer.execute(device, encoder);
+            WGPUTexture depthTex = aurora_get_depth_texture();
+            self->m_aoPass.execute(device, encoder, depthTex, self->m_collector.last_camera_data());
         }, this);
     }
 

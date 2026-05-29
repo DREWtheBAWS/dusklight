@@ -44,6 +44,9 @@ public:
     uint32_t node_count() const { return static_cast<uint32_t>(m_nodes.size()); }
     bool     empty()      const { return m_nodes.empty(); }
 
+    const std::vector<BvhNode>&  nodes() const { return m_nodes; }
+    const std::vector<Triangle>& tris()  const { return m_tris; }
+
 private:
     std::vector<BvhNode>  m_nodes;
     std::vector<Triangle> m_tris;  // reordered for spatial locality during build

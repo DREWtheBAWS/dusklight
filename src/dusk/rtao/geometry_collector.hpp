@@ -20,6 +20,14 @@ public:
         float    buildMs   = 0.f;
     };
 
+    struct CameraData {
+        float proj[4][4] = {};   // GX projection matrix (row-major)
+        float view[4][4] = {};   // model-view matrix for the first qualifying draw, extended to 4x4
+        float worldPos[3] = {};  // camera world-space position (derived from view inverse)
+        float fovYDeg = 0.f;     // vertical FOV in degrees (from proj[1][1])
+        bool  valid = false;
+    };
+
     // Call once at startup to register the Aurora capture callback.
     // Defined in geometry_collector_aurora.cpp (not linked into tests).
     void install();
@@ -33,11 +41,15 @@ public:
 
     Stats              last_stats()        const { return m_lastStats; }
     const std::string& last_dump_message() const { return m_lastDumpMsg; }
+    CameraData         last_camera_data()  const { return m_lastCameraData; }
 
     // Triggers a BVH build from the current frame's geometry on the next end_frame().
     // The result persists until the next build is requested.
-    void     request_bvh_build();
-    BvhStats last_bvh_stats() const { return m_lastBvhStats; }
+    void          request_bvh_build();
+    BvhStats      last_bvh_stats()  const { return m_lastBvhStats; }
+    const Bvh&    bvh()             const { return m_bvh; }
+    // Monotonically incremented each time a BVH is built. Use to detect new builds.
+    uint32_t      bvh_generation()  const { return m_bvhGeneration; }
 
     // Filter: only collect perspective draws whose viewport meets minimum dimensions.
     // Defaults keep UI, HUD, and small shadow-map passes out of the capture.
@@ -57,6 +69,8 @@ private:
     void process_draw(const AuroraGxCaptureDraw* draw);
     bool write_obj(const std::string& path) const;
 
+    static CameraData extract_camera_data(const AuroraGxCaptureDraw* draw);
+
     std::vector<Triangle> m_triangles;
     uint32_t m_drawCallCount = 0;
 
@@ -64,8 +78,12 @@ private:
     std::string m_pendingDumpPath;
     std::string m_lastDumpMsg;
 
+    CameraData  m_pendingCameraData;
+    CameraData  m_lastCameraData;
+
     Bvh      m_bvh;
     BvhStats m_lastBvhStats;
+    uint32_t m_bvhGeneration  = 0;
     bool     m_pendingBvhBuild = false;
 
     bool  m_perspectiveOnly = true;

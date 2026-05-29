@@ -10,6 +10,7 @@
 #include "ImGuiStateShare.hpp"
 #include "dusk/rtao/geometry_collector.hpp"
 #include "dusk/rtao/depth_viewer.hpp"
+#include "dusk/rtao/ao_pass.hpp"
 
 namespace dusk {
     class ImGuiMenuTools {
@@ -63,8 +64,9 @@ namespace dusk {
         std::string m_controllerName;
 
         bool m_showRtaoCapture = false;
-        dusk::rtao::GeometryCollector m_collector;
+        dusk::rtao::GeometryCollector  m_collector;
         dusk::rtao::DepthTextureViewer m_depthViewer;
+        dusk::rtao::AoPass             m_aoPass;
     };
 }
 
