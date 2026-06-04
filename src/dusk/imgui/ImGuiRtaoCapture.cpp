@@ -17,6 +17,8 @@ void ImGuiMenuTools::ShowRtaoCaptureWindow() {
     const auto stats = m_collector.last_stats();
     ImGui::Text("Triangles (last frame): %u", stats.triangleCount);
     ImGui::Text("Draw calls (last frame): %u", stats.drawCallCount);
+    ImGui::Text("Alpha textures: %u / %u total", static_cast<uint32_t>(m_collector.texture_views().size()),
+                m_collector.total_alpha_tex_count());
 
     const auto cam = m_collector.last_camera_data();
     if (cam.valid) {

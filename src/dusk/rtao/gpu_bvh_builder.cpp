@@ -16,7 +16,7 @@ namespace dusk::rtao {
 //   3: b_morton   read-write storage — Morton codes           (u32 each)
 //   4: b_idx      read-write storage — sort permutation       (u32 each)
 //   5: b_nodes    read-write storage — BVH nodes              (BvhNode each)
-//   6: b_tri_out  read-write storage — sorted GpuTriangle out (12 f32 each)
+//   6: b_tri_out  read-write storage — sorted GpuTriangle out (20 f32 each)
 //   7: b_params   uniform            — Params (4 x u32)
 //
 // BvhNode layout (48 bytes, identical to what AoPass expects):
@@ -66,10 +66,11 @@ struct BvhNode {
 fn cs_bounds(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= b_params.tri_count) { return; }
-    let s = i * 9u;
-    let ax = b_tri_in[s];      let ay = b_tri_in[s+1u]; let az = b_tri_in[s+2u];
-    let bx = b_tri_in[s+3u];  let by = b_tri_in[s+4u]; let bz = b_tri_in[s+5u];
-    let cx = b_tri_in[s+6u];  let cy = b_tri_in[s+7u]; let cz = b_tri_in[s+8u];
+    // GpuTriangle layout (20 f32): a[0-2], _p0[3], b[4-6], _p1[7], c[8-10], ...
+    let s = i * 20u;
+    let ax = b_tri_in[s];     let ay = b_tri_in[s+1u]; let az = b_tri_in[s+2u];
+    let bx = b_tri_in[s+4u];  let by = b_tri_in[s+5u]; let bz = b_tri_in[s+6u];
+    let cx = b_tri_in[s+8u];  let cy = b_tri_in[s+9u]; let cz = b_tri_in[s+10u];
     let d = i * 6u;
     b_aabb[d]   = min(ax, min(bx, cx));
     b_aabb[d+1u] = min(ay, min(by, cy));
@@ -206,15 +207,13 @@ fn cs_init_leaves(@builtin(global_invocation_id) gid: vec3<u32>) {
     b_nodes[leaf].tri_count   = 1u;
     b_nodes[leaf].range_first = i;
     b_nodes[leaf].range_last  = i;
-    // Write sorted GpuTriangle (48 B: 3 verts × 4 f32, 4th f32 is padding)
-    let src = tri * 9u;
-    let dst = i   * 12u;
-    b_tri_out[dst+ 0u]=b_tri_in[src+0u]; b_tri_out[dst+ 1u]=b_tri_in[src+1u];
-    b_tri_out[dst+ 2u]=b_tri_in[src+2u]; b_tri_out[dst+ 3u]=0.0;
-    b_tri_out[dst+ 4u]=b_tri_in[src+3u]; b_tri_out[dst+ 5u]=b_tri_in[src+4u];
-    b_tri_out[dst+ 6u]=b_tri_in[src+5u]; b_tri_out[dst+ 7u]=0.0;
-    b_tri_out[dst+ 8u]=b_tri_in[src+6u]; b_tri_out[dst+ 9u]=b_tri_in[src+7u];
-    b_tri_out[dst+10u]=b_tri_in[src+8u]; b_tri_out[dst+11u]=0.0;
+    // Write sorted GpuTriangle (80 B = 20 f32): verbatim copy preserves positions,
+    // padding, UVs, texIdx, and flags (u32 bits stored as f32 bits in b_tri_in).
+    let src = tri * 20u;
+    let dst = i   * 20u;
+    for (var k = 0u; k < 20u; k += 1u) {
+        b_tri_out[dst + k] = b_tri_in[src + k];
+    }
 }
 
 // ==========================================================================
@@ -492,14 +491,14 @@ void GpuBvhBuilder::resize_buffers(WGPUDevice device, uint32_t n) {
     if (!m_sortStepsBuf)
         m_sortStepsBuf = make_buf(device, 512 * 256, WGPUBufferUsage_Uniform);
 
-    m_triInputBuf = make_buf(device, uint64_t(n)    * 36, WGPUBufferUsage_Storage);
+    m_triInputBuf = make_buf(device, uint64_t(n)    * 80, WGPUBufferUsage_Storage);
     m_aabbBuf     = make_buf(device, uint64_t(n)    * 24, WGPUBufferUsage_Storage);
     m_mortonBuf   = make_buf(device, uint64_t(np)   *  4, WGPUBufferUsage_Storage);
     m_indicesBuf  = make_buf(device, uint64_t(np)   *  4, WGPUBufferUsage_Storage);
     // AoPass reads these directly — no copy needed; UAV state decays to D3D12
     // COMMON between command lists, allowing implicit SRV promotion on the next read.
     m_nodeBuf = make_buf(device, uint64_t(2*n-1) * 48, WGPUBufferUsage_Storage);
-    m_triBuf  = make_buf(device, uint64_t(n)     * 48, WGPUBufferUsage_Storage);
+    m_triBuf  = make_buf(device, uint64_t(n)     * 80, WGPUBufferUsage_Storage);
     m_bufCapacity = n;
 }
 
@@ -510,15 +509,23 @@ void GpuBvhBuilder::upload_triangles(WGPUDevice device,
     resize_buffers(device, n);
     m_triCount = n;
 
-    // Pack triangles into CPU vector; the actual GPU upload happens inside
-    // build() via a staging buffer so the COPY_DST→storage transition is
-    // handled by Dawn within the encoder rather than across submissions.
-    m_pendingTriData.resize(n * 9u);
+    // Pack triangles into CPU vector matching GpuTriangle layout (20 f32 = 80 B).
+    // Fields: a[3], _p0, b[3], _p1, c[3], _p2, uva[2], uvb[2], uvc[2], texIdx, flags.
+    // texIdx and flags are u32s stored as bit-identical f32 (read back as u32 via struct).
+    // The actual GPU upload happens inside build() via a staging buffer.
+    m_pendingTriData.resize(n * 20u);
     for (uint32_t i = 0; i < n; ++i) {
         const auto& t = tris[i];
-        m_pendingTriData[i*9+0] = t.a.x; m_pendingTriData[i*9+1] = t.a.y; m_pendingTriData[i*9+2] = t.a.z;
-        m_pendingTriData[i*9+3] = t.b.x; m_pendingTriData[i*9+4] = t.b.y; m_pendingTriData[i*9+5] = t.b.z;
-        m_pendingTriData[i*9+6] = t.c.x; m_pendingTriData[i*9+7] = t.c.y; m_pendingTriData[i*9+8] = t.c.z;
+        float* p = m_pendingTriData.data() + i * 20u;
+        p[ 0] = t.a.x;   p[ 1] = t.a.y;   p[ 2] = t.a.z;   p[ 3] = 0.f;
+        p[ 4] = t.b.x;   p[ 5] = t.b.y;   p[ 6] = t.b.z;   p[ 7] = 0.f;
+        p[ 8] = t.c.x;   p[ 9] = t.c.y;   p[10] = t.c.z;   p[11] = 0.f;
+        p[12] = t.uva.u; p[13] = t.uva.v;
+        p[14] = t.uvb.u; p[15] = t.uvb.v;
+        p[16] = t.uvc.u; p[17] = t.uvc.v;
+        uint32_t ti = t.texIdx, fl = t.flags;
+        memcpy(&p[18], &ti, 4);
+        memcpy(&p[19], &fl, 4);
     }
 }
 
@@ -558,9 +565,10 @@ void GpuBvhBuilder::build(WGPUDevice device, WGPUCommandEncoder encoder) {
     float sceneMax[3] = {-1e30f, -1e30f, -1e30f};
     for (uint32_t i = 0; i < n; ++i) {
         for (int k = 0; k < 3; ++k) {
-            const float va = m_pendingTriData[i*9 + k];
-            const float vb = m_pendingTriData[i*9 + 3 + k];
-            const float vc = m_pendingTriData[i*9 + 6 + k];
+            // GpuTriangle stride = 20 f32; a at [0], b at [4], c at [8]
+            const float va = m_pendingTriData[i*20 + k];
+            const float vb = m_pendingTriData[i*20 + 4 + k];
+            const float vc = m_pendingTriData[i*20 + 8 + k];
             sceneMin[k] = std::min({sceneMin[k], va, vb, vc});
             sceneMax[k] = std::max({sceneMax[k], va, vb, vc});
         }
@@ -584,7 +592,7 @@ void GpuBvhBuilder::build(WGPUDevice device, WGPUCommandEncoder encoder) {
     // commands.  The Morton AABB replaces cs_reduce: it's the ±m_mortonRange clamp
     // computed above, isolating the relevant scene geometry from distant outliers.
     {
-        const uint64_t triBytes = uint64_t(m_triCount) * 36u;
+        const uint64_t triBytes = uint64_t(m_triCount) * 80u;
         WGPUBuffer stag = make_upload_buf(device, m_pendingTriData.data(), triBytes);
         wgpuCommandEncoderCopyBufferToBuffer(encoder, stag, 0, m_triInputBuf, 0, triBytes);
         wgpuBufferRelease(stag);

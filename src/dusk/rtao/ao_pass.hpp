@@ -21,10 +21,14 @@ public:
     void set_params(const Params& p) { m_params = p; }
 
     // Run the AO compute pass.  nodeBuf and triBuf come from GpuBvhBuilder each frame.
+    // texViews is the per-frame list of WGPUTextureView* for alpha-tested textures
+    // (from GeometryCollector::texture_views()).  Empty slots are filled with a
+    // 1×1 opaque-white fallback so all 16 shader slots are always bound.
     void execute(WGPUDevice device, WGPUCommandEncoder encoder,
                  WGPUTexture depthTex,
                  const GeometryCollector::CameraData& cam,
-                 WGPUBuffer nodeBuf, WGPUBuffer triBuf);
+                 WGPUBuffer nodeBuf, WGPUBuffer triBuf,
+                 const std::vector<void*>& texViews);
 
     ImTextureID imgui_texture_id()   const;
     ImTextureID limits_texture_id()  const;
@@ -59,6 +63,13 @@ private:
 
     WGPUBindGroup m_bindGroup      = nullptr;
     bool          m_bindGroupDirty = true;
+
+    // Alpha-texture sampler + 1×1 opaque-white fallback (pad empty slots).
+    WGPUSampler     m_alphaSampler = nullptr;
+    WGPUTexture     m_fallbackTex  = nullptr;
+    WGPUTextureView m_fallbackView = nullptr;
+    // Per-frame snapshot of texture_views() — invalidates bind group on change.
+    std::vector<void*> m_lastTexViews;
 
     uint32_t m_width  = 0;
     uint32_t m_height = 0;

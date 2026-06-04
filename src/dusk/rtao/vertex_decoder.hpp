@@ -9,13 +9,28 @@ struct Vec3 {
   bool operator==(const Vec3&) const = default;
 };
 
-struct Triangle {
-  Vec3 a, b, c;
+struct Vec2 {
+  float u, v;
 };
 
-// Decode GX vertex data into world-space triangles.
+struct Triangle {
+  Vec3     a, b, c;
+  Vec2     uva, uvb, uvc;
+  uint32_t texIdx = 0;
+  uint32_t flags  = 0;  // bit 0: triangle has an alpha-tested texture
+};
+
+// Decode GX vertex data into view-space triangles (positions only).
 // Each position is decoded from its compact GX format and transformed by the
 // corresponding position matrix. Returns one Triangle per index triple.
 std::vector<Triangle> decode_triangles(const AuroraGxCaptureDraw& draw);
+
+// Decode GX tex coord 0 data and write UVs into the triangles produced by
+// decode_triangles (must be called with the same draw and matching tris vector).
+// Sets texIdx and flags on each triangle according to the draw's texture/alpha state.
+// texSlot is the caller-assigned texture registry slot for this draw (0xFFFFFFFF = none).
+void decode_uvs(const AuroraGxCaptureDraw& draw,
+                std::vector<Triangle>& tris,
+                uint32_t texSlot);
 
 } // namespace dusk::rtao

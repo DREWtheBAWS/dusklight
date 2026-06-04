@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace dusk::rtao {
@@ -24,13 +25,15 @@ struct GpuBvhNode {
 };
 static_assert(sizeof(GpuBvhNode) == 48);
 
-// 48 bytes — matches WGSL GpuTriangle
+// 80 bytes — matches WGSL GpuTriangle (positions + UVs + alpha-texture index/flags)
 struct GpuTriangle {
-    float a[3]; float _p0;
-    float b[3]; float _p1;
-    float c[3]; float _p2;
+    float    a[3]; float    _p0;      // @ 0-15
+    float    b[3]; float    _p1;      // @ 16-31
+    float    c[3]; float    _p2;      // @ 32-47
+    float    uva[2]; float  uvb[2];   // @ 48-63
+    float    uvc[2]; uint32_t texIdx; uint32_t flags; // @ 64-79
 };
-static_assert(sizeof(GpuTriangle) == 48);
+static_assert(sizeof(GpuTriangle) == 80);
 
 // 112 bytes — matches WGSL Camera uniform
 struct GpuCamera {
@@ -113,10 +116,12 @@ static bool compute_inv_proj(const GeometryCollector::CameraData& cam,
 }
 
 // ---------------------------------------------------------------------------
-// WGSL compute shader
+// WGSL compute shader (built dynamically to generate N alpha-texture slots)
 // ---------------------------------------------------------------------------
 
-static const char kShader[] = R"(
+static std::string build_ao_shader() {
+    std::string s;
+    s += R"(
 // ---- GPU-side BVH structs (must match GpuBvhNode / GpuTriangle on CPU) ----
 
 struct BvhNode {
@@ -131,12 +136,17 @@ struct BvhNode {
 }
 
 struct GpuTriangle {
-    a  : vec3<f32>,
-    _p0: f32,
-    b  : vec3<f32>,
-    _p1: f32,
-    c  : vec3<f32>,
-    _p2: f32,
+    a       : vec3<f32>,   // offset 0
+    _p0     : f32,         // offset 12
+    b       : vec3<f32>,   // offset 16
+    _p1     : f32,         // offset 28
+    c       : vec3<f32>,   // offset 32
+    _p2     : f32,         // offset 44
+    uva     : vec2<f32>,   // offset 48
+    uvb     : vec2<f32>,   // offset 56
+    uvc     : vec2<f32>,   // offset 64
+    tex_idx : u32,         // offset 72
+    flags   : u32,         // offset 76
 }
 
 struct Camera {
@@ -156,11 +166,40 @@ struct Camera {
 }
 
 @group(0) @binding(0) var<storage, read> bvh_nodes  : array<BvhNode>;
-@group(0) @binding(1) var<storage, read> triangles   : array<GpuTriangle>;
-@group(0) @binding(2) var<uniform>       cam         : Camera;
-@group(0) @binding(3) var               t_depth     : texture_depth_2d;
-@group(0) @binding(4) var               ao_out      : texture_storage_2d<rgba8unorm, write>;
-@group(0) @binding(5) var               limits_out  : texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(1) var<storage, read> triangles  : array<GpuTriangle>;
+@group(0) @binding(2) var<uniform>       cam        : Camera;
+@group(0) @binding(3) var               t_depth    : texture_depth_2d;
+@group(0) @binding(4) var               ao_out     : texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(5) var               limits_out : texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(6) var               s_alpha    : sampler;
+)";
+    // Generate 16 alpha-texture slots (bindings 7-22)
+    for (int i = 0; i < 16; ++i) {
+        s += "@group(0) @binding(";
+        s += std::to_string(7 + i);
+        s += ") var t_alpha_";
+        s += std::to_string(i);
+        s += " : texture_2d<f32>;\n";
+    }
+    // sample_alpha: barycentric UV interpolation + switch-based texture sample.
+    // bar_u/bar_v are the Möller–Trumbore u/v coordinates: weight for b and c
+    // respectively; weight for a = 1 - bar_u - bar_v.
+    s += R"(
+fn sample_alpha(tri: GpuTriangle, bar_u: f32, bar_v: f32) -> f32 {
+    if ((tri.flags & 1u) == 0u) { return 1.0; }
+    let w  = 1.0 - bar_u - bar_v;
+    let uv = w * tri.uva + bar_u * tri.uvb + bar_v * tri.uvc;
+    switch tri.tex_idx {
+)";
+    for (int i = 0; i < 16; ++i) {
+        s += "        case ";
+        s += std::to_string(i);
+        s += "u: { return textureSampleLevel(t_alpha_";
+        s += std::to_string(i);
+        s += ", s_alpha, uv, 0.0).a; }\n";
+    }
+    s += "        default: { return 1.0; }\n    }\n}\n";
+    s += R"(
 
 // ---- PCG random number generator ----
 
@@ -205,27 +244,27 @@ fn aabb_hit(node: BvhNode, origin: vec3<f32>, inv_dir: vec3<f32>, tmax: f32) -> 
     return tmin_s <= tmax_s;
 }
 
-// ---- Möller–Trumbore triangle intersection (double-sided) ----
+// ---- Möller–Trumbore triangle intersection (double-sided) with alpha test ----
 
 fn ray_tri_hit(origin: vec3<f32>, dir: vec3<f32>,
                tri: GpuTriangle, tmax: f32) -> bool {
-    let a = tri.a;
-    let b = tri.b;
-    let c = tri.c;
-    let e1 = b - a;
-    let e2 = c - a;
+    let e1 = tri.b - tri.a;
+    let e2 = tri.c - tri.a;
     let h  = cross(dir, e2);
     let det = dot(e1, h);
     if (abs(det) < 1e-7) { return false; }
     let inv_det = 1.0 / det;
-    let s = origin - a;
-    let u = dot(s, h) * inv_det;
+    let sv = origin - tri.a;
+    let u = dot(sv, h) * inv_det;
     if (u < 0.0 || u > 1.0) { return false; }
-    let q = cross(s, e1);
+    let q = cross(sv, e1);
     let v = dot(dir, q) * inv_det;
     if (v < 0.0 || u + v > 1.0) { return false; }
     let t = dot(e2, q) * inv_det;
-    return t > 1e-4 && t < tmax;
+    if (t <= 1e-4 || t >= tmax) { return false; }
+    // Alpha test: sample the texture at the interpolated UV and discard if transparent.
+    if (sample_alpha(tri, u, v) < 0.5) { return false; }
+    return true;
 }
 
 // ---- Stack-based BVH traversal (left_child / right_child format) ----
@@ -449,6 +488,8 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (c10.x < W && c01.y < H) { textureStore(limits_out, c11, lim_val); }
 }
 )";
+    return s;
+}
 
 // ---------------------------------------------------------------------------
 // WebGPU helpers
@@ -480,6 +521,9 @@ AoPass::~AoPass() {
     if (m_limTex)      wgpuTextureRelease(m_limTex);
     if (m_aoView)      wgpuTextureViewRelease(m_aoView);
     if (m_aoTex)       wgpuTextureRelease(m_aoTex);
+    if (m_fallbackView) wgpuTextureViewRelease(m_fallbackView);
+    if (m_fallbackTex)  wgpuTextureRelease(m_fallbackTex);
+    if (m_alphaSampler) wgpuSamplerRelease(m_alphaSampler);
     if (m_cameraUbo)   wgpuBufferRelease(m_cameraUbo);
     if (m_bgl)         wgpuBindGroupLayoutRelease(m_bgl);
     if (m_pipeline)    wgpuComputePipelineRelease(m_pipeline);
@@ -488,15 +532,16 @@ AoPass::~AoPass() {
 void AoPass::ensure_pipeline(WGPUDevice device) {
     if (m_pipeline) return;
 
+    const std::string shaderSrc = build_ao_shader();
     WGPUShaderSourceWGSL wgslSrc{};
     wgslSrc.chain.sType = WGPUSType_ShaderSourceWGSL;
-    wgslSrc.code        = {kShader, WGPU_STRLEN};
+    wgslSrc.code        = {shaderSrc.c_str(), WGPU_STRLEN};
     WGPUShaderModuleDescriptor smDesc{};
     smDesc.nextInChain = &wgslSrc.chain;
     WGPUShaderModule sm = wgpuDeviceCreateShaderModule(device, &smDesc);
 
-    // Bind group layout: 6 entries
-    WGPUBindGroupLayoutEntry entries[6] = {};
+    // Bind group layout: 6 fixed + 1 sampler + 16 alpha textures = 23 entries
+    WGPUBindGroupLayoutEntry entries[23] = {};
 
     entries[0].binding          = 0;
     entries[0].visibility       = WGPUShaderStage_Compute;
@@ -528,8 +573,22 @@ void AoPass::ensure_pipeline(WGPUDevice device) {
     entries[5].storageTexture.format         = WGPUTextureFormat_RGBA8Unorm;
     entries[5].storageTexture.viewDimension  = WGPUTextureViewDimension_2D;
 
+    // Binding 6: filtering sampler for alpha texture lookup
+    entries[6].binding       = 6;
+    entries[6].visibility    = WGPUShaderStage_Compute;
+    entries[6].sampler.type  = WGPUSamplerBindingType_Filtering;
+
+    // Bindings 7-22: 16 alpha-tested texture slots (float sampling)
+    for (int i = 0; i < 16; ++i) {
+        entries[7 + i].binding               = 7 + i;
+        entries[7 + i].visibility            = WGPUShaderStage_Compute;
+        entries[7 + i].texture.sampleType    = WGPUTextureSampleType_Float;
+        entries[7 + i].texture.viewDimension = WGPUTextureViewDimension_2D;
+        entries[7 + i].texture.multisampled  = 0;
+    }
+
     WGPUBindGroupLayoutDescriptor bglDesc{};
-    bglDesc.entryCount = 6;
+    bglDesc.entryCount = 23;
     bglDesc.entries    = entries;
     m_bgl = wgpuDeviceCreateBindGroupLayout(device, &bglDesc);
 
@@ -590,17 +649,26 @@ void AoPass::rebuild_depth_binding(WGPUDevice device, WGPUTexture depthTex) {
 void AoPass::rebuild_bind_group(WGPUDevice device) {
     if (m_bindGroup) { wgpuBindGroupRelease(m_bindGroup); m_bindGroup = nullptr; }
 
-    WGPUBindGroupEntry entries[6] = {};
+    WGPUBindGroupEntry entries[23] = {};
     entries[0].binding = 0; entries[0].buffer = m_lastNodeBuf; entries[0].size = WGPU_WHOLE_SIZE;
     entries[1].binding = 1; entries[1].buffer = m_lastTriBuf;  entries[1].size = WGPU_WHOLE_SIZE;
     entries[2].binding = 2; entries[2].buffer = m_cameraUbo;   entries[2].size = sizeof(GpuCamera);
     entries[3].binding = 3; entries[3].textureView = m_depthView;
     entries[4].binding = 4; entries[4].textureView = m_aoView;
     entries[5].binding = 5; entries[5].textureView = m_limView;
+    entries[6].binding = 6; entries[6].sampler = m_alphaSampler;
+    // Bindings 7-22: real alpha textures, empty slots filled with the 1×1 white fallback.
+    for (int i = 0; i < 16; ++i) {
+        entries[7 + i].binding = 7 + i;
+        entries[7 + i].textureView =
+            (i < static_cast<int>(m_lastTexViews.size()))
+            ? static_cast<WGPUTextureView>(m_lastTexViews[i])
+            : m_fallbackView;
+    }
 
     WGPUBindGroupDescriptor bgd{};
     bgd.layout     = m_bgl;
-    bgd.entryCount = 6;
+    bgd.entryCount = 23;
     bgd.entries    = entries;
     m_bindGroup      = wgpuDeviceCreateBindGroup(device, &bgd);
     m_bindGroupDirty = false;
@@ -609,13 +677,20 @@ void AoPass::rebuild_bind_group(WGPUDevice device) {
 void AoPass::execute(WGPUDevice device, WGPUCommandEncoder encoder,
                      WGPUTexture depthTex,
                      const GeometryCollector::CameraData& cam,
-                     WGPUBuffer nodeBuf, WGPUBuffer triBuf) {
+                     WGPUBuffer nodeBuf, WGPUBuffer triBuf,
+                     const std::vector<void*>& texViews) {
     if (!cam.valid || !depthTex || !nodeBuf || !triBuf) return;
 
     // Invalidate bind group when the BVH buffers change frame-to-frame
     if (nodeBuf != m_lastNodeBuf || triBuf != m_lastTriBuf) {
         m_lastNodeBuf    = nodeBuf;
         m_lastTriBuf     = triBuf;
+        m_bindGroupDirty = true;
+    }
+
+    // Invalidate bind group when the alpha-texture set changes
+    if (texViews != m_lastTexViews) {
+        m_lastTexViews   = texViews;
         m_bindGroupDirty = true;
     }
 
@@ -654,6 +729,43 @@ void AoPass::execute(WGPUDevice device, WGPUCommandEncoder encoder,
         m_cameraUbo = create_buffer(device, sizeof(GpuCamera), WGPUBufferUsage_Uniform);
         m_bindGroupDirty = true;
     }
+
+    // Create alpha-texture sampler and 1×1 opaque-white fallback texture (once).
+    if (!m_alphaSampler) {
+        WGPUSamplerDescriptor sd{};
+        sd.addressModeU  = WGPUAddressMode_Repeat;
+        sd.addressModeV  = WGPUAddressMode_Repeat;
+        sd.minFilter     = WGPUFilterMode_Linear;
+        sd.magFilter     = WGPUFilterMode_Linear;
+        sd.mipmapFilter  = WGPUMipmapFilterMode_Nearest;
+        sd.maxAnisotropy = 1;
+        m_alphaSampler = wgpuDeviceCreateSampler(device, &sd);
+        m_bindGroupDirty = true;
+    }
+    if (!m_fallbackTex) {
+        WGPUTextureDescriptor ftd{};
+        ftd.usage         = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+        ftd.dimension     = WGPUTextureDimension_2D;
+        ftd.size          = {1, 1, 1};
+        ftd.format        = WGPUTextureFormat_RGBA8Unorm;
+        ftd.mipLevelCount = 1;
+        ftd.sampleCount   = 1;
+        m_fallbackTex  = wgpuDeviceCreateTexture(device, &ftd);
+        m_fallbackView = wgpuTextureCreateView(m_fallbackTex, nullptr);
+        // 1×1 fully opaque white — sample_alpha returns 1.0 (opaque) for empty slots
+        const uint8_t white[4] = {255, 255, 255, 255};
+        WGPUQueue fq = wgpuDeviceGetQueue(device);
+        WGPUTexelCopyTextureInfo ict{};
+        ict.texture  = m_fallbackTex;
+        WGPUTexelCopyBufferLayout tdl{};
+        tdl.bytesPerRow  = 4;
+        tdl.rowsPerImage = 1;
+        WGPUExtent3D ext{1, 1, 1};
+        wgpuQueueWriteTexture(fq, &ict, white, 4, &tdl, &ext);
+        wgpuQueueRelease(fq);
+        m_bindGroupDirty = true;
+    }
+
     WGPUQueue q = wgpuDeviceGetQueue(device);
     wgpuQueueWriteBuffer(q, m_cameraUbo, 0, &gpuCam, sizeof(GpuCamera));
     wgpuQueueRelease(q);

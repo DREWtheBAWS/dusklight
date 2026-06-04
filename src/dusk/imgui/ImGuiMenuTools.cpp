@@ -61,7 +61,8 @@ namespace dusk {
                 self->m_aoPass.execute(device, encoder, depthTex,
                                        self->m_collector.pending_camera_data(),
                                        self->m_bvhBuilder.node_buf(),
-                                       self->m_bvhBuilder.tri_buf());
+                                       self->m_bvhBuilder.tri_buf(),
+                                       self->m_collector.texture_views());
             }
         }, this);
     }

@@ -16,6 +16,12 @@ static constexpr uint8_t kGxIndex8  = 2;
 // GXCompCnt (position)
 static constexpr uint8_t kGxPosXYZ = 1;
 
+// GXCompCnt (tex coord)
+static constexpr uint8_t kGxTexST = 1;  // 0 = S only, 1 = ST
+
+// GXCompare (alpha compare)
+static constexpr uint8_t kGxAlways = 7;
+
 namespace dusk::rtao {
 
 static float read_f32_be(const uint8_t* p) {
@@ -117,6 +123,60 @@ std::vector<Triangle> decode_triangles(const AuroraGxCaptureDraw& draw) {
     });
   }
   return out;
+}
+
+static Vec2 decode_uv(const AuroraGxCaptureDraw& d, uint32_t vi) {
+  if (d.tex0AttrType == 0) return {0.f, 0.f}; // GX_NONE
+
+  const uint8_t* vtx = d.vertData + vi * d.vertStride + d.tex0Offset;
+
+  const uint8_t* src;
+  if (d.tex0AttrType == kGxDirect) {
+    src = vtx;
+    // DIRECT tex coords in the FIFO are big-endian
+    const uint8_t stride = comp_byte_size(d.tex0CompType);
+    float u = decode_comp(src,          d.tex0CompType, d.tex0Frac, false);
+    float v = (d.tex0CompCnt == kGxTexST)
+              ? decode_comp(src + stride, d.tex0CompType, d.tex0Frac, false)
+              : 0.f;
+    return {u, v};
+  }
+  // Indexed: read the index, then fetch from the indirect array (little-endian)
+  uint32_t idx = (d.tex0AttrType == kGxIndex8)
+                 ? *vtx
+                 : uint32_t(read_u16_be(vtx));
+  src = d.tex0Array + idx * d.tex0ArrayStride;
+  const uint8_t stride = comp_byte_size(d.tex0CompType);
+  float u = decode_comp(src,          d.tex0CompType, d.tex0Frac, false);
+  float v = (d.tex0CompCnt == kGxTexST)
+            ? decode_comp(src + stride, d.tex0CompType, d.tex0Frac, false)
+            : 0.f;
+  return {u, v};
+}
+
+void decode_uvs(const AuroraGxCaptureDraw& draw,
+                std::vector<Triangle>& tris,
+                uint32_t texSlot) {
+  // Determine if this draw uses alpha-tested transparency.
+  static constexpr uint8_t kAopOr = 1; // GXAlphaOp::GX_AOP_OR
+  const bool comp0Always = (draw.alphaComp0 == kGxAlways);
+  const bool comp1Always = (draw.alphaComp1 == kGxAlways);
+  const bool trivialPass = (comp0Always && comp1Always)
+                        || (draw.alphaOp == kAopOr && (comp0Always || comp1Always));
+  const bool hasAlphaTest = (draw.tex0AttrType != 0) && draw.tex0HasAlpha && !trivialPass;
+
+  const bool activeAlpha = hasAlphaTest && (texSlot != 0xFFFFFFFFu);
+  for (uint32_t i = 0; i < static_cast<uint32_t>(tris.size()); ++i) {
+    const uint32_t ia = draw.indices[i * 3];
+    const uint32_t ib = draw.indices[i * 3 + 1];
+    const uint32_t ic = draw.indices[i * 3 + 2];
+    auto& t = tris[i];
+    t.uva    = decode_uv(draw, ia);
+    t.uvb    = decode_uv(draw, ib);
+    t.uvc    = decode_uv(draw, ic);
+    t.texIdx = activeAlpha ? texSlot : 0u;
+    t.flags  = activeAlpha ? 1u : 0u;
+  }
 }
 
 } // namespace dusk::rtao

@@ -1,6 +1,7 @@
 #pragma once
 #include "vertex_decoder.hpp"
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 struct AuroraGxCaptureDraw;
@@ -36,7 +37,12 @@ public:
     CameraData         last_camera_data()    const { return m_lastCameraData; }
     CameraData         pending_camera_data() const { return m_pendingCameraData; }
 
-    const std::vector<Triangle>& raw_triangles() const { return m_triangles; }
+    const std::vector<Triangle>& raw_triangles()   const { return m_triangles; }
+    // Per-frame ordered list of WGPUTextureView pointers (as void*) for alpha-tested
+    // textures, indexed by Triangle::texIdx.  Valid until the next end_frame().
+    const std::vector<void*>&   texture_views()    const { return m_textureViews; }
+    // Total unique alpha textures seen this frame (may exceed kMaxTexSlots).
+    uint32_t                    total_alpha_tex_count() const { return m_totalAlphaTexCount; }
 
     void set_filter(bool perspectiveOnly, float minViewportW = 320.f, float minViewportH = 240.f) {
         m_perspectiveOnly = perspectiveOnly;
@@ -86,7 +92,13 @@ private:
     float m_frustumMargin   = 0.f;
     float m_maxEdgeLen      = 0.f;
 
+    // Per-frame alpha-texture registry (max kMaxTexSlots entries).
+    std::unordered_map<void*, uint32_t> m_texViewToSlot;
+    std::vector<void*>                  m_textureViews;
+    uint32_t                            m_totalAlphaTexCount = 0;
+
     static constexpr uint32_t kMaxTriangles = 500'000;
+    static constexpr uint32_t kMaxTexSlots  = 16;
 };
 
 } // namespace dusk::rtao

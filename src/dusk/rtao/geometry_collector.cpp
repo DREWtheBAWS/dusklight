@@ -54,9 +54,12 @@ void GeometryCollector::process_draw(const AuroraGxCaptureDraw* draw) {
     // so raw_triangles() stays valid through the post-render callback.
     if (m_pendingTriClear) {
         m_triangles.clear();
-        m_drawCallCount     = 0;
-        m_pendingCameraData = {};
-        m_pendingTriClear   = false;
+        m_drawCallCount      = 0;
+        m_pendingCameraData  = {};
+        m_texViewToSlot.clear();
+        m_textureViews.clear();
+        m_totalAlphaTexCount = 0;
+        m_pendingTriClear    = false;
     }
 
     if (draw->indexCount == 0 || m_triangles.size() >= kMaxTriangles) return;
@@ -82,7 +85,38 @@ void GeometryCollector::process_draw(const AuroraGxCaptureDraw* draw) {
     }
 
     ++m_drawCallCount;
+
+    // Register alpha-tested texture before decoding triangles so we can pass the slot.
+    // kNoSlot means "overflow / no valid slot" — decode_uvs will leave flags=0.
+    static constexpr uint32_t kNoSlot = 0xFFFFFFFFu;
+    uint32_t texSlot = kNoSlot;
+    // GX combined alpha test: result = op(comp0(alpha, ref0), comp1(alpha, ref1)).
+    // Trivially passes (no clipping) when both operands are ALWAYS, or when
+    // op is OR and at least one operand is ALWAYS.
+    static constexpr uint8_t kAlways = 7; // GXCompare::GX_ALWAYS
+    static constexpr uint8_t kAopOr  = 1; // GXAlphaOp::GX_AOP_OR
+    const bool comp0Always = (draw->alphaComp0 == kAlways);
+    const bool comp1Always = (draw->alphaComp1 == kAlways);
+    const bool trivialPass = (comp0Always && comp1Always)
+                          || (draw->alphaOp == kAopOr && (comp0Always || comp1Always));
+    if (draw->tex0View && draw->tex0HasAlpha && !trivialPass) {
+        auto [it, inserted] = m_texViewToSlot.emplace(draw->tex0View,
+                                                       static_cast<uint32_t>(m_textureViews.size()));
+        if (inserted) {
+            ++m_totalAlphaTexCount; // count all unique textures, even those that overflow
+            if (m_textureViews.size() < kMaxTexSlots) {
+                m_textureViews.push_back(draw->tex0View);
+            } else {
+                m_texViewToSlot.erase(it); // slot table full — treat as opaque
+            }
+        }
+        auto found = m_texViewToSlot.find(draw->tex0View);
+        if (found != m_texViewToSlot.end())
+            texSlot = found->second;
+    }
+
     auto tris = decode_triangles(*draw);
+    decode_uvs(*draw, tris, texSlot);
     const float r2  = m_maxAoDistance * m_maxAoDistance;
     // Projection params for frustum culling: cot(fovX/2) and cot(fovY/2).
     // The first qualifying draw already set m_pendingCameraData.proj above, so these are valid.
