@@ -34,9 +34,35 @@ namespace dusk {
         m_collector.install();
         aurora_set_post_render_callback([](WGPUDevice device, WGPUCommandEncoder encoder, void* userdata) {
             auto* self = static_cast<ImGuiMenuTools*>(userdata);
-            self->m_depthViewer.execute(device, encoder);
+            const bool doRebuild = !self->m_bvhFrozen || self->m_bvhCaptureOnce;
+            if (doRebuild) {
+                // Rebuild the BVH from this frame's captured geometry (view space).
+                const auto& tris = self->m_collector.raw_triangles();
+                if (!tris.empty()) {
+                    self->m_bvhBuilder.upload_triangles(device, tris);
+                    // build() records uploads + BVH passes + copy into Aurora's encoder
+                    // so every COPY_DST→* transition is handled within one command buffer.
+                    self->m_bvhBuilder.build(device, encoder);
+
+                    // "Capture once" → freeze after this one rebuild
+                    if (self->m_bvhCaptureOnce) {
+                        self->m_bvhFrozen      = true;
+                        self->m_bvhCaptureOnce = false;
+                    }
+                }
+            }
+
+            // AO pass always runs (if BVH was built at least once).
+            // Use pending_camera_data() (current frame, set during fifo::drain) rather
+            // than last_camera_data() (previous frame) to keep the projection matrix
+            // in sync with the depth buffer and the BVH triangles.
             WGPUTexture depthTex = aurora_get_depth_texture();
-            self->m_aoPass.execute(device, encoder, depthTex, self->m_collector.last_camera_data());
+            if (self->m_bvhBuilder.is_ready() && !self->m_buildBvhOnly) {
+                self->m_aoPass.execute(device, encoder, depthTex,
+                                       self->m_collector.pending_camera_data(),
+                                       self->m_bvhBuilder.node_buf(),
+                                       self->m_bvhBuilder.tri_buf());
+            }
         }, this);
     }
 

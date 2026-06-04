@@ -11,6 +11,7 @@
 #include "dusk/rtao/geometry_collector.hpp"
 #include "dusk/rtao/depth_viewer.hpp"
 #include "dusk/rtao/ao_pass.hpp"
+#include "dusk/rtao/gpu_bvh_builder.hpp"
 
 namespace dusk {
     class ImGuiMenuTools {
@@ -63,9 +64,13 @@ namespace dusk {
         int m_inputOverlayCorner = 3;
         std::string m_controllerName;
 
-        bool m_showRtaoCapture = false;
+        bool m_showRtaoCapture  = false;
+        bool m_buildBvhOnly    = false;  // debug: skip AO pass after BVH build
+        bool m_bvhFrozen       = false;  // debug: stop rebuilding BVH each frame
+        bool m_bvhCaptureOnce  = false;  // debug: do one rebuild then auto-freeze
         dusk::rtao::GeometryCollector  m_collector;
         dusk::rtao::DepthTextureViewer m_depthViewer;
+        dusk::rtao::GpuBvhBuilder      m_bvhBuilder;
         dusk::rtao::AoPass             m_aoPass;
     };
 }

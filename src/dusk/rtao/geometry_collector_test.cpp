@@ -186,32 +186,17 @@ TEST_CASE("GeometryCollector: dump message includes triangle count") {
 }
 
 // ==========================================================================
-// TEST: BVH build on demand produces a valid tree
+// TEST: raw_triangles() reflects captured geometry before end_frame clears
 // ==========================================================================
-TEST_CASE("GeometryCollector: request_bvh_build builds a non-empty BVH") {
+TEST_CASE("GeometryCollector: raw_triangles returns captured geometry") {
     GeometryCollector gc;
 
     std::vector<uint8_t> v; std::vector<uint16_t> idx;
     gc.simulate_draw(make_triangle_draw(v, idx, 0,0,0, 1,0,0, 0,1,0));
     gc.simulate_draw(make_triangle_draw(v, idx, 2,0,0, 3,0,0, 2,1,0));
 
-    gc.request_bvh_build();
+    CHECK(gc.raw_triangles().size() == 2);
     gc.end_frame();
-
-    const auto stats = gc.last_bvh_stats();
-    CHECK(stats.nodeCount >= 1);
-    CHECK(stats.buildMs >= 0.f);
-}
-
-// ==========================================================================
-// TEST: BVH not rebuilt unless explicitly requested
-// ==========================================================================
-TEST_CASE("GeometryCollector: BVH is only built when explicitly requested") {
-    GeometryCollector gc;
-
-    std::vector<uint8_t> v; std::vector<uint16_t> idx;
-    gc.simulate_draw(make_triangle_draw(v, idx, 0,0,0, 1,0,0, 0,1,0));
-    gc.end_frame();  // no request_bvh_build()
-
-    CHECK(gc.last_bvh_stats().nodeCount == 0);
+    // still accessible immediately after end_frame (cleared on next process_draw)
+    CHECK(gc.raw_triangles().size() == 2);
 }

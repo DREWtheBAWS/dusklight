@@ -15,9 +15,9 @@ namespace dusk::rtao {
 // 48 bytes — matches WGSL BvhNode
 struct GpuBvhNode {
     float    boundsMin[3]; // offset 0
-    uint32_t hitNext;      // offset 12
+    uint32_t leftChild;    // offset 12
     float    boundsMax[3]; // offset 16
-    uint32_t missNext;     // offset 28
+    uint32_t rightChild;   // offset 28
     uint32_t triOffset;    // offset 32
     uint32_t triCount;     // offset 36
     uint32_t _pad[2];      // offset 40 → total 48
@@ -32,18 +32,23 @@ struct GpuTriangle {
 };
 static_assert(sizeof(GpuTriangle) == 48);
 
-// 96 bytes — matches WGSL Camera uniform
+// 112 bytes — matches WGSL Camera uniform
 struct GpuCamera {
-    float    invViewProj[16]; // col-major mat4x4, offset 0
+    float    invViewProj[16]; // col-major mat4x4 = inv(VP), offset 0
     uint32_t screenWidth;     // offset 64
     uint32_t screenHeight;    // offset 68
     uint32_t raysPerPixel;    // offset 72
     uint32_t frameSeed;       // offset 76
     float    maxDistance;     // offset 80
-    float    normalBias;      // offset 84 — view-space units to push ray origin off surface
-    uint32_t _pad[2];         // offset 88 → total 96
+    float    normalBias;      // offset 84
+    uint32_t debugMode;       // offset 88  0=AO,1=normals,2=depth,3=root-AABB
+    uint32_t debugMode2;      // offset 92  0=limit-hits,1=AO,2=normals,3=depth,4=root-AABB
+    float    camWorldX;       // offset 96  camera world position (for world-space AO)
+    float    camWorldY;       // offset 100
+    float    camWorldZ;       // offset 104
+    uint32_t _pad2;           // offset 108
 };
-static_assert(sizeof(GpuCamera) == 96);
+static_assert(sizeof(GpuCamera) == 112);
 
 // ---------------------------------------------------------------------------
 // CPU-side 4×4 matrix math
@@ -79,35 +84,31 @@ static bool mat4_invert_flat(const float m[16], float inv[16]) {
     return true;
 }
 
-// Build the inv(proj) uniform for the WGSL mat4x4.
+// Build inv(P) for the WGSL mat4x4 uniform.
 //
-// The BVH triangles are in GX view/camera space (after pnMtx), so the unproject
-// must yield view-space positions → only inv(P) is needed, not inv(view*proj).
+// BVH triangles are in view space (camera at origin), so the unproject only
+// needs to invert the GX projection matrix.  Forward transform:
+//   clip = P_GX × view_pos  →  inv(P_GX) × clip = view_pos
 //
-// geometry_capture.h: projMtx[4][4] is the GX projection matrix stored row-major
-// (projMtx[row][col]).  Reading it as cam.proj[c][r] with c treated as the first
-// index recovers P_GX transposed into P_flat.  mat4_invert_flat then gives
-// inv(P_GX^T) = inv(P_GX)^T.  The final store into out_col_major (column-major
-// for WGSL) transposes again, so WGSL computes v * M_wgsl = inv(P_GX)*v. ✓
+// P_GX comes from cam.proj (row-major: projMtx[row][col]).
 //
-// GX NDC Z range: near=-1, far=0 (OpenGL-style).  Aurora reversed-Z stores
-// depth = -z_ndc_gx, so load_depth returns z_ndc_gx = -raw ∈ [-1, 0].
+// WGSL receives inv(P) stored row-major in the column-major slot so that
+//   WGSL  v * M_wgsl  =  (inv(P) × v)^T   ✓
+//
+// GX NDC Z: near=-1, far=0.  Aurora reversed-Z: load_depth returns -raw ∈ [-1,0].
 static bool compute_inv_proj(const GeometryCollector::CameraData& cam,
                               float out_col_major[16]) {
-    // Recover P in row-major [r][c] from Aurora's column-major [c][r].
-    float P_flat[16];
+    float P_flat[16] = {};
     for (int r = 0; r < 4; ++r)
         for (int c = 0; c < 4; ++c)
-            P_flat[r*4 + c] = cam.proj[c][r];
+            P_flat[r*4 + c] = cam.proj[r][c];
 
     float invP_rm[16];
     if (!mat4_invert_flat(P_flat, invP_rm)) return false;
 
-    // Transpose to column-major for WGSL mat4x4
-    for (int r = 0; r < 4; ++r)
-        for (int c = 0; c < 4; ++c)
-            out_col_major[c*4 + r] = invP_rm[r*4 + c];
-
+    // Storing invP_rm row-major into out_col_major puts inv(P)^T in WGSL
+    // column-major: `v * M_wgsl = (inv(P) × v)^T`. ✓
+    std::memcpy(out_col_major, invP_rm, 16 * sizeof(float));
     return true;
 }
 
@@ -119,13 +120,14 @@ static const char kShader[] = R"(
 // ---- GPU-side BVH structs (must match GpuBvhNode / GpuTriangle on CPU) ----
 
 struct BvhNode {
-    bounds_min : vec3<f32>,  // offset 0
-    hit_next   : u32,        // offset 12
-    bounds_max : vec3<f32>,  // offset 16
-    miss_next  : u32,        // offset 28
-    tri_offset : u32,        // offset 32
-    tri_count  : u32,        // offset 36
-    _pad       : vec2<u32>,  // offset 40
+    bounds_min  : vec3<f32>,   // offset 0
+    left_child  : u32,         // offset 12  (0xFFFFFFFF for leaf)
+    bounds_max  : vec3<f32>,   // offset 16
+    right_child : u32,         // offset 28
+    tri_offset  : u32,         // offset 32
+    tri_count   : u32,         // offset 36  (0=interior, 1=leaf)
+    range_first : u32,         // offset 40  (build-time, ignored here)
+    range_last  : u32,         // offset 44  (build-time, ignored here)
 }
 
 struct GpuTriangle {
@@ -138,20 +140,27 @@ struct GpuTriangle {
 }
 
 struct Camera {
-    inv_view_proj : mat4x4<f32>,  // offset 0 (column-major), size 64
+    inv_view_proj : mat4x4<f32>,  // offset 0 (column-major) = inv(P), unprojects NDC → view space
     screen_width  : u32,          // offset 64
     screen_height : u32,          // offset 68
     rays_per_pixel: u32,          // offset 72
     frame_seed    : u32,          // offset 76
     max_distance  : f32,          // offset 80
     normal_bias   : f32,          // offset 84
+    debug_mode    : u32,          // offset 88  0=AO, 1=normals, 2=depth, 3=root-AABB
+    debug_mode2   : u32,          // offset 92  0=limit-hits,1=AO,2=normals,3=depth,4=root-AABB,5=visit-heat,6=limit%
+    cam_world_x   : f32,          // offset 96  camera world position
+    cam_world_y   : f32,          // offset 100
+    cam_world_z   : f32,          // offset 104
+    _pad2         : u32,          // offset 108
 }
 
-@group(0) @binding(0) var<storage, read> bvh_nodes : array<BvhNode>;
-@group(0) @binding(1) var<storage, read> triangles  : array<GpuTriangle>;
-@group(0) @binding(2) var<uniform>       cam        : Camera;
-@group(0) @binding(3) var               t_depth    : texture_depth_2d;
-@group(0) @binding(4) var               ao_out     : texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(0) var<storage, read> bvh_nodes  : array<BvhNode>;
+@group(0) @binding(1) var<storage, read> triangles   : array<GpuTriangle>;
+@group(0) @binding(2) var<uniform>       cam         : Camera;
+@group(0) @binding(3) var               t_depth     : texture_depth_2d;
+@group(0) @binding(4) var               ao_out      : texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(5) var               limits_out  : texture_storage_2d<rgba8unorm, write>;
 
 // ---- PCG random number generator ----
 
@@ -219,30 +228,52 @@ fn ray_tri_hit(origin: vec3<f32>, dir: vec3<f32>,
     return t > 1e-4 && t < tmax;
 }
 
-// ---- Stackless BVH traversal ----
+// ---- Stack-based BVH traversal (left_child / right_child format) ----
+// kMaxNodeVisits guards against runaway traversal in degenerate BVH subtrees.
+// 4096 is generous for a depth-≤62 LBVH (30 Morton bits + 32 index tie-break
+// bits = max depth 62; stack-based DFS visits each node at most once per ray).
+// Raising this causes GPU stalls: kMaxNodeVisits × rays_per_pixel × num_pixels
+// of traversal work quickly reaches billions of iterations per frame.
+const kMaxNodeVisits: u32 = 4096u;
 
-fn intersects_any(origin: vec3<f32>, dir: vec3<f32>, tmax: f32) -> bool {
-    let n = arrayLength(&bvh_nodes);
-    if (n == 0u) { return false; }
+// Returns 0=miss, 1=hit, 2=visit-limit reached.
+// Accumulates per-traversal node visits into *acc_visits for the heatmap.
+fn intersects_any(origin: vec3<f32>, dir: vec3<f32>, tmax: f32,
+                  acc_visits: ptr<function, u32>) -> u32 {
+    if (arrayLength(&bvh_nodes) == 0u) { return 0u; }
     let inv_dir = vec3<f32>(1.0/dir.x, 1.0/dir.y, 1.0/dir.z);
-    var idx: u32 = 0u;
+    // 128-entry stack: Karras LBVH with 30-bit Morton codes has max depth ~30;
+    // duplicate codes allow tie-breaking up to ~62 levels deep.  128 entries
+    // gives comfortable headroom for two children pushed per level.
+    var stk: array<u32, 128>;
+    var sp: i32 = 1;
+    stk[0] = 0u;
+    var visits: u32 = 0u;
     loop {
-        if (idx >= n || idx == 0xFFFFFFFFu) { break; }
+        if (sp <= 0 || visits >= kMaxNodeVisits) { break; }
+        sp -= 1;
+        visits += 1u;
+        let idx  = stk[u32(sp)];
         let node = bvh_nodes[idx];
-        if (!aabb_hit(node, origin, inv_dir, tmax)) {
-            idx = node.miss_next;
-            continue;
-        }
+        if (!aabb_hit(node, origin, inv_dir, tmax)) { continue; }
         if (node.tri_count > 0u) {
             for (var i = node.tri_offset; i < node.tri_offset + node.tri_count; i += 1u) {
-                if (ray_tri_hit(origin, dir, triangles[i], tmax)) { return true; }
+                if (ray_tri_hit(origin, dir, triangles[i], tmax)) {
+                    *acc_visits += visits;
+                    return 1u;
+                }
             }
-            idx = node.miss_next;
         } else {
-            idx = node.hit_next;
+            // Guard: need sp+2 <= 127 before pushing two children.
+            if (sp < 126) {
+                // Push right first so left is processed first (LIFO)
+                stk[u32(sp)] = node.right_child; sp += 1;
+                stk[u32(sp)] = node.left_child;  sp += 1;
+            }
         }
     }
-    return false;
+    *acc_visits += visits;
+    return select(0u, 2u, visits >= kMaxNodeVisits);
 }
 
 // ---- Depth → view-space position ----
@@ -289,57 +320,133 @@ fn estimate_normal(px: u32, py: u32, pos: vec3<f32>) -> vec3<f32> {
     let nl = length(n);
     if (nl < 1e-6) { return vec3<f32>(0.0, 1.0, 0.0); }
     var n_norm = n / nl;
-    // The cross product sign depends on surface orientation; orient toward camera.
-    // In view space the camera is at the origin, so the toward-camera direction is -normalize(pos).
-    // All visible surfaces must face the camera, so flip if needed.
-    if (dot(n_norm, -normalize(pos)) < 0.0) { n_norm = -n_norm; }
+    // Orient toward camera.  BVH and positions are in view space; camera is at origin.
+    if (dot(n_norm, normalize(-pos)) < 0.0) { n_norm = -n_norm; }
     return n_norm;
 }
 
 // ---- Main compute entry point ----
 
+// Dispatched at half resolution; each thread writes a 2×2 pixel block.
+// Always runs AO rays so both panels have fresh hit/limit data regardless
+// of which debug view is selected.
 @compute @workgroup_size(8, 8)
 fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let px = gid.x;
-    let py = gid.y;
+    let px = gid.x * 2u;
+    let py = gid.y * 2u;
     if (px >= cam.screen_width || py >= cam.screen_height) { return; }
 
-    // Sample depth; treat far-plane pixels as fully lit (no geometry).
-    // Aurora uses reversed-Z (near=1, far=0), so sky pixels have d near 0.
+    let W = i32(cam.screen_width);
+    let H = i32(cam.screen_height);
+    let c00 = vec2<i32>(i32(px),   i32(py));
+    let c10 = vec2<i32>(i32(px)+1, i32(py));
+    let c01 = vec2<i32>(i32(px),   i32(py)+1);
+    let c11 = vec2<i32>(i32(px)+1, i32(py)+1);
+
     let d = textureLoad(t_depth, vec2<i32>(i32(px), i32(py)), 0);
     if (d <= 0.0001) {
-        textureStore(ao_out, vec2<i32>(i32(px), i32(py)), vec4<f32>(1.0, 1.0, 1.0, 1.0));
+        // Sky pixel — red in left panel, black in right panel
+        let ao_sky  = vec4<f32>(1.0, 0.0, 0.0, 1.0);
+        let lim_sky = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        textureStore(ao_out,    vec2<i32>(i32(px),   i32(py)),   ao_sky);
+        textureStore(ao_out,    vec2<i32>(i32(px)+1, i32(py)),   ao_sky);
+        textureStore(ao_out,    vec2<i32>(i32(px),   i32(py)+1), ao_sky);
+        textureStore(ao_out,    vec2<i32>(i32(px)+1, i32(py)+1), ao_sky);
+        textureStore(limits_out, vec2<i32>(i32(px),   i32(py)),   lim_sky);
+        textureStore(limits_out, vec2<i32>(i32(px)+1, i32(py)),   lim_sky);
+        textureStore(limits_out, vec2<i32>(i32(px),   i32(py)+1), lim_sky);
+        textureStore(limits_out, vec2<i32>(i32(px)+1, i32(py)+1), lim_sky);
         return;
     }
 
     let pos_h = unproject(px, py);
     if (pos_h.w < 0.5) {
-        textureStore(ao_out, vec2<i32>(i32(px), i32(py)), vec4<f32>(1.0, 1.0, 1.0, 1.0));
+        let bad = vec4<f32>(0.0, 0.0, 1.0, 1.0);
+        textureStore(ao_out,    vec2<i32>(i32(px),   i32(py)),   bad);
+        textureStore(ao_out,    vec2<i32>(i32(px)+1, i32(py)),   bad);
+        textureStore(ao_out,    vec2<i32>(i32(px),   i32(py)+1), bad);
+        textureStore(ao_out,    vec2<i32>(i32(px)+1, i32(py)+1), bad);
+        textureStore(limits_out, vec2<i32>(i32(px),   i32(py)),   bad);
+        textureStore(limits_out, vec2<i32>(i32(px)+1, i32(py)),   bad);
+        textureStore(limits_out, vec2<i32>(i32(px),   i32(py)+1), bad);
+        textureStore(limits_out, vec2<i32>(i32(px)+1, i32(py)+1), bad);
         return;
     }
     let pos    = pos_h.xyz;
     let normal = estimate_normal(px, py, pos);
 
-    // Offset the ray origin along the surface normal to avoid self-intersection.
-    // The bias scales with distance from camera; the constant factor (normal_bias)
-    // is tunable so it can be matched to the game's world-unit scale.
-    let dist_from_cam = length(pos);
+    // Always run AO rays — both panels need hit/limit_hit/visit data.
+    // BVH and positions are in view space: camera is at the origin.
+    let dist_from_cam  = length(pos);
     let ray_origin = pos + normal * max(dist_from_cam * cam.normal_bias, cam.normal_bias * 10.0);
-
-    // Per-pixel seed = (y * W + x) * large_prime XOR frame_seed
     var seed = pcg(((py * cam.screen_width + px) * 1664525u) ^ cam.frame_seed);
-
     var hits: u32 = 0u;
+    var limit_hits: u32 = 0u;
+    var total_visits: u32 = 0u;
     let N = cam.rays_per_pixel;
     for (var i = 0u; i < N; i += 1u) {
         let dir = cosine_hemisphere(normal, &seed);
-        if (intersects_any(ray_origin, dir, cam.max_distance)) {
-            hits += 1u;
-        }
+        let r = intersects_any(ray_origin, dir, cam.max_distance, &total_visits);
+        if (r == 1u) { hits       += 1u; }
+        if (r == 2u) { limit_hits += 1u; }
     }
 
-    let ao = 1.0 - f32(hits) / f32(N);
-    textureStore(ao_out, vec2<i32>(i32(px), i32(py)), vec4<f32>(ao, ao, ao, 1.0));
+    // Normalize only over rays that completed traversal — limit-reached rays are
+    // neither hits nor misses, so including them in the denominator biases AO bright.
+    let valid = N - limit_hits;
+    let ao = select(0.5, 1.0 - f32(hits) / f32(valid), valid > 0u);
+
+    // Root AABB hit — reused by both panels when debug_mode == 3 / debug_mode2 == 4.
+    let root = bvh_nodes[0];
+    let root_hit = aabb_hit(root, pos, vec3<f32>(1.0/0.1, 1.0/0.1, 1.0/(-1.0)), cam.max_distance);
+
+    // Left panel (ao_out): select based on debug_mode
+    var ao_val: vec4<f32>;
+    if (cam.debug_mode == 1u) {
+        ao_val = vec4<f32>(normal * 0.5 + 0.5, 1.0);
+    } else if (cam.debug_mode == 2u) {
+        ao_val = vec4<f32>(dist_from_cam / 2000.0, 0.0, 0.0, 1.0);
+    } else if (cam.debug_mode == 3u) {
+        ao_val = select(vec4<f32>(1.0, 0.0, 0.0, 1.0), vec4<f32>(0.0, 1.0, 0.0, 1.0), root_hit);
+    } else {
+        ao_val = vec4<f32>(ao, ao, ao, 1.0);
+    }
+
+    // Right panel (limits_out): select based on debug_mode2
+    var lim_val: vec4<f32>;
+    if (cam.debug_mode2 == 1u) {
+        lim_val = vec4<f32>(ao, ao, ao, 1.0);
+    } else if (cam.debug_mode2 == 2u) {
+        lim_val = vec4<f32>(normal * 0.5 + 0.5, 1.0);
+    } else if (cam.debug_mode2 == 3u) {
+        lim_val = vec4<f32>(dist_from_cam / 2000.0, 0.0, 0.0, 1.0);
+    } else if (cam.debug_mode2 == 4u) {
+        lim_val = select(vec4<f32>(1.0, 0.0, 0.0, 1.0), vec4<f32>(0.0, 1.0, 0.0, 1.0), root_hit);
+    } else if (cam.debug_mode2 == 5u) {
+        // Visit heat: avg node visits per ray, clamped to [0, 4096].
+        // Bright red = expensive traversal (bad BVH quality / inflated scene AABB).
+        let avg = f32(total_visits) / f32(N);
+        lim_val = vec4<f32>(min(avg / 4096.0, 1.0), 0.0, 0.0, 1.0);
+    } else if (cam.debug_mode2 == 6u) {
+        // Limit %: fraction of rays that hit kMaxNodeVisits, shown as magenta gradient.
+        let frac = f32(limit_hits) / f32(N);
+        lim_val = vec4<f32>(frac, 0.0, frac, 1.0);
+    } else {
+        // 0: Limit Hits — magenta where kMaxNodeVisits was reached (BVH corruption)
+        lim_val = select(vec4<f32>(0.0, 0.0, 0.0, 1.0),
+                         vec4<f32>(1.0, 0.0, 1.0, 1.0),
+                         limit_hits > N / 2u);
+    }
+
+    textureStore(ao_out, c00, ao_val);
+    if (c10.x < W) { textureStore(ao_out, c10, ao_val); }
+    if (c01.y < H) { textureStore(ao_out, c01, ao_val); }
+    if (c10.x < W && c01.y < H) { textureStore(ao_out, c11, ao_val); }
+
+    textureStore(limits_out, c00, lim_val);
+    if (c10.x < W) { textureStore(limits_out, c10, lim_val); }
+    if (c01.y < H) { textureStore(limits_out, c01, lim_val); }
+    if (c10.x < W && c01.y < H) { textureStore(limits_out, c11, lim_val); }
 }
 )";
 
@@ -367,69 +474,15 @@ static WGPUBuffer create_buffer(WGPUDevice device, uint64_t size, WGPUBufferUsag
 // ---------------------------------------------------------------------------
 
 AoPass::~AoPass() {
-    if (m_bindGroup)  wgpuBindGroupRelease(m_bindGroup);
-    if (m_depthView)  wgpuTextureViewRelease(m_depthView);
-    if (m_aoView)     wgpuTextureViewRelease(m_aoView);
-    if (m_aoTex)      wgpuTextureRelease(m_aoTex);
-    if (m_cameraUbo)  wgpuBufferRelease(m_cameraUbo);
-    if (m_triBuf)     wgpuBufferRelease(m_triBuf);
-    if (m_nodeBuf)    wgpuBufferRelease(m_nodeBuf);
-    if (m_bgl)        wgpuBindGroupLayoutRelease(m_bgl);
-    if (m_pipeline)   wgpuComputePipelineRelease(m_pipeline);
-}
-
-void AoPass::queue_bvh_upload(const Bvh& bvh) {
-    if (bvh.empty()) return;
-
-    auto pending = std::make_unique<PendingBvh>();
-
-    const auto& src_nodes = bvh.nodes();
-    pending->nodeCount = static_cast<uint32_t>(src_nodes.size());
-    pending->nodeData.resize(src_nodes.size() * sizeof(GpuBvhNode));
-    auto* gpu_nodes = reinterpret_cast<GpuBvhNode*>(pending->nodeData.data());
-    for (size_t i = 0; i < src_nodes.size(); ++i) {
-        const auto& n = src_nodes[i];
-        gpu_nodes[i].boundsMin[0] = n.bounds.min.x;
-        gpu_nodes[i].boundsMin[1] = n.bounds.min.y;
-        gpu_nodes[i].boundsMin[2] = n.bounds.min.z;
-        gpu_nodes[i].hitNext      = n.hit_next;
-        gpu_nodes[i].boundsMax[0] = n.bounds.max.x;
-        gpu_nodes[i].boundsMax[1] = n.bounds.max.y;
-        gpu_nodes[i].boundsMax[2] = n.bounds.max.z;
-        gpu_nodes[i].missNext     = n.miss_next;
-        gpu_nodes[i].triOffset    = n.tri_offset;
-        gpu_nodes[i].triCount     = n.tri_count;
-        gpu_nodes[i]._pad[0]      = 0;
-        gpu_nodes[i]._pad[1]      = 0;
-    }
-
-    const auto& src_tris = bvh.tris();
-    pending->triCount = static_cast<uint32_t>(src_tris.size());
-    pending->triData.resize(src_tris.size() * sizeof(GpuTriangle));
-    auto* gpu_tris = reinterpret_cast<GpuTriangle*>(pending->triData.data());
-    for (size_t i = 0; i < src_tris.size(); ++i) {
-        gpu_tris[i].a[0] = src_tris[i].a.x; gpu_tris[i].a[1] = src_tris[i].a.y; gpu_tris[i].a[2] = src_tris[i].a.z; gpu_tris[i]._p0 = 0;
-        gpu_tris[i].b[0] = src_tris[i].b.x; gpu_tris[i].b[1] = src_tris[i].b.y; gpu_tris[i].b[2] = src_tris[i].b.z; gpu_tris[i]._p1 = 0;
-        gpu_tris[i].c[0] = src_tris[i].c.x; gpu_tris[i].c[1] = src_tris[i].c.y; gpu_tris[i].c[2] = src_tris[i].c.z; gpu_tris[i]._p2 = 0;
-    }
-
-    m_pendingBvh = std::move(pending);
-}
-
-void AoPass::flush_pending_upload(WGPUDevice device) {
-    if (!m_pendingBvh) return;
-
-    if (m_nodeBuf) { wgpuBufferRelease(m_nodeBuf); m_nodeBuf = nullptr; }
-    if (m_triBuf)  { wgpuBufferRelease(m_triBuf);  m_triBuf  = nullptr; }
-
-    m_nodeBuf = create_buffer(device, m_pendingBvh->nodeData.size(),
-                              WGPUBufferUsage_Storage, m_pendingBvh->nodeData.data());
-    m_triBuf  = create_buffer(device, m_pendingBvh->triData.size(),
-                              WGPUBufferUsage_Storage, m_pendingBvh->triData.data());
-    m_nodeCount = m_pendingBvh->nodeCount;
-    m_triCount  = m_pendingBvh->triCount;
-    m_pendingBvh.reset();
-    m_bindGroupDirty = true;
+    if (m_bindGroup)   wgpuBindGroupRelease(m_bindGroup);
+    if (m_depthView)   wgpuTextureViewRelease(m_depthView);
+    if (m_limView)     wgpuTextureViewRelease(m_limView);
+    if (m_limTex)      wgpuTextureRelease(m_limTex);
+    if (m_aoView)      wgpuTextureViewRelease(m_aoView);
+    if (m_aoTex)       wgpuTextureRelease(m_aoTex);
+    if (m_cameraUbo)   wgpuBufferRelease(m_cameraUbo);
+    if (m_bgl)         wgpuBindGroupLayoutRelease(m_bgl);
+    if (m_pipeline)    wgpuComputePipelineRelease(m_pipeline);
 }
 
 void AoPass::ensure_pipeline(WGPUDevice device) {
@@ -442,40 +495,41 @@ void AoPass::ensure_pipeline(WGPUDevice device) {
     smDesc.nextInChain = &wgslSrc.chain;
     WGPUShaderModule sm = wgpuDeviceCreateShaderModule(device, &smDesc);
 
-    // Bind group layout: 5 entries
-    WGPUBindGroupLayoutEntry entries[5] = {};
+    // Bind group layout: 6 entries
+    WGPUBindGroupLayoutEntry entries[6] = {};
 
-    // 0: BVH nodes (read-only storage buffer)
     entries[0].binding          = 0;
     entries[0].visibility       = WGPUShaderStage_Compute;
     entries[0].buffer.type      = WGPUBufferBindingType_ReadOnlyStorage;
 
-    // 1: triangles (read-only storage buffer)
     entries[1].binding          = 1;
     entries[1].visibility       = WGPUShaderStage_Compute;
     entries[1].buffer.type      = WGPUBufferBindingType_ReadOnlyStorage;
 
-    // 2: camera uniform
     entries[2].binding          = 2;
     entries[2].visibility       = WGPUShaderStage_Compute;
     entries[2].buffer.type      = WGPUBufferBindingType_Uniform;
 
-    // 3: depth texture
     entries[3].binding                     = 3;
     entries[3].visibility                  = WGPUShaderStage_Compute;
     entries[3].texture.sampleType          = WGPUTextureSampleType_Depth;
     entries[3].texture.viewDimension       = WGPUTextureViewDimension_2D;
     entries[3].texture.multisampled        = 0;
 
-    // 4: AO output (write-only storage texture)
     entries[4].binding                       = 4;
     entries[4].visibility                    = WGPUShaderStage_Compute;
     entries[4].storageTexture.access         = WGPUStorageTextureAccess_WriteOnly;
     entries[4].storageTexture.format         = WGPUTextureFormat_RGBA8Unorm;
     entries[4].storageTexture.viewDimension  = WGPUTextureViewDimension_2D;
 
+    entries[5].binding                       = 5;
+    entries[5].visibility                    = WGPUShaderStage_Compute;
+    entries[5].storageTexture.access         = WGPUStorageTextureAccess_WriteOnly;
+    entries[5].storageTexture.format         = WGPUTextureFormat_RGBA8Unorm;
+    entries[5].storageTexture.viewDimension  = WGPUTextureViewDimension_2D;
+
     WGPUBindGroupLayoutDescriptor bglDesc{};
-    bglDesc.entryCount = 5;
+    bglDesc.entryCount = 6;
     bglDesc.entries    = entries;
     m_bgl = wgpuDeviceCreateBindGroupLayout(device, &bglDesc);
 
@@ -495,8 +549,10 @@ void AoPass::ensure_pipeline(WGPUDevice device) {
 }
 
 void AoPass::rebuild_output(WGPUDevice device, uint32_t w, uint32_t h) {
-    if (m_aoView) { wgpuTextureViewRelease(m_aoView); m_aoView = nullptr; }
-    if (m_aoTex)  { wgpuTextureRelease(m_aoTex);      m_aoTex  = nullptr; }
+    if (m_aoView)  { wgpuTextureViewRelease(m_aoView);  m_aoView  = nullptr; }
+    if (m_aoTex)   { wgpuTextureRelease(m_aoTex);       m_aoTex   = nullptr; }
+    if (m_limView) { wgpuTextureViewRelease(m_limView); m_limView = nullptr; }
+    if (m_limTex)  { wgpuTextureRelease(m_limTex);      m_limTex  = nullptr; }
 
     WGPUTextureDescriptor td{};
     td.usage         = WGPUTextureUsage_StorageBinding | WGPUTextureUsage_TextureBinding;
@@ -507,6 +563,8 @@ void AoPass::rebuild_output(WGPUDevice device, uint32_t w, uint32_t h) {
     td.sampleCount   = 1;
     m_aoTex  = wgpuDeviceCreateTexture(device, &td);
     m_aoView = wgpuTextureCreateView(m_aoTex, nullptr);
+    m_limTex  = wgpuDeviceCreateTexture(device, &td);
+    m_limView = wgpuTextureCreateView(m_limTex, nullptr);
 
     m_width  = w;
     m_height = h;
@@ -532,17 +590,17 @@ void AoPass::rebuild_depth_binding(WGPUDevice device, WGPUTexture depthTex) {
 void AoPass::rebuild_bind_group(WGPUDevice device) {
     if (m_bindGroup) { wgpuBindGroupRelease(m_bindGroup); m_bindGroup = nullptr; }
 
-    WGPUBindGroupEntry entries[5] = {};
-    // size = WGPU_WHOLE_SIZE (0) binds the entire buffer
-    entries[0].binding = 0; entries[0].buffer = m_nodeBuf;   entries[0].size = WGPU_WHOLE_SIZE;
-    entries[1].binding = 1; entries[1].buffer = m_triBuf;    entries[1].size = WGPU_WHOLE_SIZE;
-    entries[2].binding = 2; entries[2].buffer = m_cameraUbo; entries[2].size = sizeof(GpuCamera);
+    WGPUBindGroupEntry entries[6] = {};
+    entries[0].binding = 0; entries[0].buffer = m_lastNodeBuf; entries[0].size = WGPU_WHOLE_SIZE;
+    entries[1].binding = 1; entries[1].buffer = m_lastTriBuf;  entries[1].size = WGPU_WHOLE_SIZE;
+    entries[2].binding = 2; entries[2].buffer = m_cameraUbo;   entries[2].size = sizeof(GpuCamera);
     entries[3].binding = 3; entries[3].textureView = m_depthView;
     entries[4].binding = 4; entries[4].textureView = m_aoView;
+    entries[5].binding = 5; entries[5].textureView = m_limView;
 
     WGPUBindGroupDescriptor bgd{};
     bgd.layout     = m_bgl;
-    bgd.entryCount = 5;
+    bgd.entryCount = 6;
     bgd.entries    = entries;
     m_bindGroup      = wgpuDeviceCreateBindGroup(device, &bgd);
     m_bindGroupDirty = false;
@@ -550,11 +608,16 @@ void AoPass::rebuild_bind_group(WGPUDevice device) {
 
 void AoPass::execute(WGPUDevice device, WGPUCommandEncoder encoder,
                      WGPUTexture depthTex,
-                     const GeometryCollector::CameraData& cam) {
-    if (!cam.valid || !depthTex) return;
+                     const GeometryCollector::CameraData& cam,
+                     WGPUBuffer nodeBuf, WGPUBuffer triBuf) {
+    if (!cam.valid || !depthTex || !nodeBuf || !triBuf) return;
 
-    flush_pending_upload(device);
-    if (!m_nodeBuf) return;
+    // Invalidate bind group when the BVH buffers change frame-to-frame
+    if (nodeBuf != m_lastNodeBuf || triBuf != m_lastTriBuf) {
+        m_lastNodeBuf    = nodeBuf;
+        m_lastTriBuf     = triBuf;
+        m_bindGroupDirty = true;
+    }
 
     const uint32_t w = wgpuTextureGetWidth(depthTex);
     const uint32_t h = wgpuTextureGetHeight(depthTex);
@@ -579,7 +642,13 @@ void AoPass::execute(WGPUDevice device, WGPUCommandEncoder encoder,
     gpuCam.frameSeed     = m_frame++;
     gpuCam.maxDistance   = m_params.maxDistance;
     gpuCam.normalBias    = m_params.normalBias;
+    gpuCam.debugMode     = m_params.debugMode;
+    gpuCam.debugMode2    = m_params.debugMode2;
     if (!compute_inv_proj(cam, gpuCam.invViewProj)) return;
+    // BVH triangles and depth are in view space; camera is at the origin.
+    gpuCam.camWorldX = 0.f;
+    gpuCam.camWorldY = 0.f;
+    gpuCam.camWorldZ = 0.f;
 
     if (!m_cameraUbo) {
         m_cameraUbo = create_buffer(device, sizeof(GpuCamera), WGPUBufferUsage_Uniform);
@@ -597,15 +666,15 @@ void AoPass::execute(WGPUDevice device, WGPUCommandEncoder encoder,
     WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(encoder, &passDesc);
     wgpuComputePassEncoderSetPipeline(pass, m_pipeline);
     wgpuComputePassEncoderSetBindGroup(pass, 0, m_bindGroup, 0, nullptr);
-    const uint32_t gx = (w + 7) / 8;
-    const uint32_t gy = (h + 7) / 8;
+    // Half-resolution dispatch — each thread writes a 2×2 block (4× work reduction).
+    const uint32_t gx = (w / 2 + 7) / 8;
+    const uint32_t gy = (h / 2 + 7) / 8;
     wgpuComputePassEncoderDispatchWorkgroups(pass, gx, gy, 1);
     wgpuComputePassEncoderEnd(pass);
     wgpuComputePassEncoderRelease(pass);
 }
 
-ImTextureID AoPass::imgui_texture_id() const {
-    return reinterpret_cast<ImTextureID>(m_aoView);
-}
+ImTextureID AoPass::imgui_texture_id()    const { return reinterpret_cast<ImTextureID>(m_aoView);  }
+ImTextureID AoPass::limits_texture_id()  const { return reinterpret_cast<ImTextureID>(m_limView); }
 
 } // namespace dusk::rtao

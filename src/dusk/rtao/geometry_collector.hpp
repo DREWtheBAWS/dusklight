@@ -1,5 +1,4 @@
 #pragma once
-#include "bvh.hpp"
 #include "vertex_decoder.hpp"
 #include <string>
 #include <vector>
@@ -15,61 +14,59 @@ public:
         uint32_t drawCallCount = 0;
     };
 
-    struct BvhStats {
-        uint32_t nodeCount = 0;
-        float    buildMs   = 0.f;
-    };
-
     struct CameraData {
-        float proj[4][4] = {};   // GX projection matrix (row-major)
-        float view[4][4] = {};   // model-view matrix for the first qualifying draw, extended to 4x4
-        float worldPos[3] = {};  // camera world-space position (derived from view inverse)
-        float fovYDeg = 0.f;     // vertical FOV in degrees (from proj[1][1])
+        float proj[4][4] = {};   // GX projection matrix (row-major), from the first qualifying draw
+        float view[4][4] = {};   // reserved for future world-space use
+        float worldPos[3] = {};  // reserved for future world-space use
+        float fovYDeg = 0.f;
         bool  valid = false;
     };
 
     // Call once at startup to register the Aurora capture callback.
-    // Defined in geometry_collector_aurora.cpp (not linked into tests).
     void install();
 
     // Called at the end of each ImGui frame (from afterDraw).
-    // Saves stats for display, handles pending OBJ dump, then resets.
     void end_frame();
 
     // Request that the next end_frame() writes an OBJ to path.
     void request_dump(std::string path);
 
-    Stats              last_stats()        const { return m_lastStats; }
-    const std::string& last_dump_message() const { return m_lastDumpMsg; }
-    CameraData         last_camera_data()  const { return m_lastCameraData; }
+    Stats              last_stats()          const { return m_lastStats; }
+    const std::string& last_dump_message()   const { return m_lastDumpMsg; }
+    CameraData         last_camera_data()    const { return m_lastCameraData; }
+    CameraData         pending_camera_data() const { return m_pendingCameraData; }
 
-    // Triggers a BVH build from the current frame's geometry on the next end_frame().
-    // The result persists until the next build is requested.
-    void          request_bvh_build();
-    BvhStats      last_bvh_stats()  const { return m_lastBvhStats; }
-    const Bvh&    bvh()             const { return m_bvh; }
-    // Monotonically incremented each time a BVH is built. Use to detect new builds.
-    uint32_t      bvh_generation()  const { return m_bvhGeneration; }
+    const std::vector<Triangle>& raw_triangles() const { return m_triangles; }
 
-    // Filter: only collect perspective draws whose viewport meets minimum dimensions.
-    // Defaults keep UI, HUD, and small shadow-map passes out of the capture.
-    // Pass 0,0 to disable viewport filtering; set perspectiveOnly=false to also
-    // capture orthographic draws.
     void set_filter(bool perspectiveOnly, float minViewportW = 320.f, float minViewportH = 240.f) {
-        m_perspectiveOnly  = perspectiveOnly;
-        m_minViewportW     = minViewportW;
-        m_minViewportH     = minViewportH;
+        m_perspectiveOnly = perspectiveOnly;
+        m_minViewportW    = minViewportW;
+        m_minViewportH    = minViewportH;
     }
 
-    // Drives the callback directly — used by unit tests and simulate_draw.
+    // Discard triangles whose centroid is farther than radius from the camera.
+    // In view space the camera is at the origin, so length(centroid) is the
+    // camera distance — same units as the AO pass maxDistance.  Pass 0 to disable.
+    void set_max_distance(float radius) { m_maxAoDistance = radius; }
+
+    // Discard triangles outside the view frustum + this margin.
+    // Set to the AO ray length so only geometry that can actually cast shadows
+    // on visible surfaces is collected, keeping the Morton AABB tight.
+    // Pass 0 to disable frustum culling.
+    void set_frustum_margin(float margin) { m_frustumMargin = margin; }
+
+    // Subdivide triangles whose longest edge exceeds this length (longest-edge bisection,
+    // up to 8 virtual sub-triangles per input).  Large terrain triangles inflate every
+    // ancestor AABB in the BVH; splitting them gives each piece its own tight Morton code.
+    // A good default is 3× the AO ray length.  Pass 0 to disable.
+    void set_max_edge_length(float len) { m_maxEdgeLen = len; }
+
     void simulate_draw(const AuroraGxCaptureDraw& draw);
 
 private:
     static void on_capture(const AuroraGxCaptureDraw* draw, void* userdata);
     void process_draw(const AuroraGxCaptureDraw* draw);
     bool write_obj(const std::string& path) const;
-
-    static CameraData extract_camera_data(const AuroraGxCaptureDraw* draw);
 
     std::vector<Triangle> m_triangles;
     uint32_t m_drawCallCount = 0;
@@ -81,14 +78,13 @@ private:
     CameraData  m_pendingCameraData;
     CameraData  m_lastCameraData;
 
-    Bvh      m_bvh;
-    BvhStats m_lastBvhStats;
-    uint32_t m_bvhGeneration  = 0;
-    bool     m_pendingBvhBuild = false;
-
+    bool  m_pendingTriClear = false;
     bool  m_perspectiveOnly = true;
     float m_minViewportW    = 320.f;
     float m_minViewportH    = 240.f;
+    float m_maxAoDistance   = 0.f;
+    float m_frustumMargin   = 0.f;
+    float m_maxEdgeLen      = 0.f;
 
     static constexpr uint32_t kMaxTriangles = 500'000;
 };
