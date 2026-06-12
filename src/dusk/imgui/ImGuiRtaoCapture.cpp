@@ -275,6 +275,16 @@ void ImGuiMenuTools::ShowRtaoCaptureWindow() {
 
     ImGui::Separator();
 
+    // Composite output — applies AO to the live game image
+    ImGui::Checkbox("Apply to game", &m_aoEnabled);
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!m_aoEnabled);
+    ImGui::SetNextItemWidth(160.f);
+    ImGui::SliderFloat("Strength", &m_aoStrength, 0.f, 1.f, "%.2f");
+    ImGui::EndDisabled();
+
+    ImGui::Separator();
+
     // AO params
     static int   s_raysPerPixel = 1;
     static float s_maxDist      = 500.f;

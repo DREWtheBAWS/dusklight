@@ -38,8 +38,9 @@ public:
                       WGPUBuffer blasNodeBuf, WGPUBuffer blasTriBuf,
                       const std::vector<void*>& texViews);
 
-    ImTextureID imgui_texture_id()   const;
-    ImTextureID limits_texture_id()  const;
+    ImTextureID     imgui_texture_id()   const;
+    ImTextureID     limits_texture_id()  const;
+    WGPUTextureView ao_texture_view()    const { return m_aoView; }
     bool     is_ready() const { return m_aoView != nullptr; }
     uint32_t width()    const { return m_width; }
     uint32_t height()   const { return m_height; }

@@ -85,6 +85,14 @@ namespace dusk {
                                            self->m_bvhBuilder.tri_buf(),
                                            texViews);
                 }
+
+                // Composite: multiply EFB color by AO result.
+                if (self->m_aoEnabled && self->m_aoPass.is_ready()) {
+                    WGPUTexture colorTex = aurora_get_color_texture();
+                    self->m_compositePass.execute(device, encoder, colorTex,
+                                                  self->m_aoPass.ao_texture_view(),
+                                                  self->m_aoStrength);
+                }
             }
         }, this);
     }
