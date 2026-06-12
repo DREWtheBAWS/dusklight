@@ -280,7 +280,21 @@ void ImGuiMenuTools::ShowRtaoCaptureWindow() {
     ImGui::SameLine();
     ImGui::BeginDisabled(!m_aoEnabled);
     ImGui::SetNextItemWidth(160.f);
-    ImGui::SliderFloat("Strength", &m_aoStrength, 0.f, 1.f, "%.2f");
+    ImGui::SliderFloat("Strength##ao", &m_aoStrength, 0.f, 1.f, "%.2f");
+    ImGui::EndDisabled();
+
+    // Denoiser
+    ImGui::Checkbox("Denoise", &m_denoiseEnabled);
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!m_denoiseEnabled);
+    ImGui::SetNextItemWidth(80.f);
+    ImGui::SliderInt("Iterations", &m_denoiseIterations, 1, static_cast<int>(dusk::rtao::AoDenoisePass::kMaxIterations));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(80.f);
+    ImGui::SliderFloat("σ depth", &m_denoiseSigmaZ, 0.001f, 1.f, "%.3f", ImGuiSliderFlags_Logarithmic);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(80.f);
+    ImGui::SliderFloat("σ AO", &m_denoiseSigmaL, 0.001f, 1.f, "%.3f", ImGuiSliderFlags_Logarithmic);
     ImGui::EndDisabled();
 
     ImGui::Separator();

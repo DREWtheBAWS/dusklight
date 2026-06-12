@@ -13,6 +13,7 @@
 #include "dusk/rtao/tlas_builder.hpp"
 #include "dusk/rtao/depth_viewer.hpp"
 #include "dusk/rtao/ao_pass.hpp"
+#include "dusk/rtao/ao_denoise.hpp"
 #include "dusk/rtao/ao_composite.hpp"
 #include "dusk/rtao/gpu_bvh_builder.hpp"
 
@@ -72,14 +73,19 @@ namespace dusk {
         bool  m_bvhFrozen       = false;  // debug: stop rebuilding BVH each frame
         bool  m_bvhCaptureOnce  = false;  // debug: do one rebuild then auto-freeze
         bool  m_useTlasBvh      = false;  // false=LBVH path, true=BLAS/TLAS path
-        bool  m_aoEnabled       = true;   // apply composite pass to the EFB
-        float m_aoStrength      = 1.0f;   // [0,1] blend factor for AO composite
+        bool     m_aoEnabled          = true;   // apply composite pass to the EFB
+        float    m_aoStrength         = 1.0f;   // [0,1] blend factor for AO composite
+        bool     m_denoiseEnabled     = true;
+        int      m_denoiseIterations  = 4;
+        float    m_denoiseSigmaZ      = 0.1f;
+        float    m_denoiseSigmaL      = 0.15f;
         dusk::rtao::BlasCache          m_blasCache;   // declared before m_collector (callback sets up pointer)
         dusk::rtao::TlasBuilder        m_tlasBuilder;
         dusk::rtao::GeometryCollector  m_collector;
         dusk::rtao::DepthTextureViewer m_depthViewer;
         dusk::rtao::GpuBvhBuilder      m_bvhBuilder;
         dusk::rtao::AoPass             m_aoPass;
+        dusk::rtao::AoDenoisePass      m_denoisePass;
         dusk::rtao::AoCompositePass    m_compositePass;
     };
 }

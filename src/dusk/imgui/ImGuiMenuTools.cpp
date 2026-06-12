@@ -86,12 +86,19 @@ namespace dusk {
                                            texViews);
                 }
 
-                // Composite: multiply EFB color by AO result.
+                // Denoise + composite: apply filtered AO to the EFB.
                 if (self->m_aoEnabled && self->m_aoPass.is_ready()) {
+                    WGPUTextureView aoView = self->m_aoPass.ao_texture_view();
+                    if (self->m_denoiseEnabled && self->m_denoiseIterations > 0) {
+                        WGPUTextureView filtered = self->m_denoisePass.execute(
+                            device, encoder, aoView, depthTex,
+                            static_cast<uint32_t>(self->m_denoiseIterations),
+                            self->m_denoiseSigmaZ, self->m_denoiseSigmaL);
+                        if (filtered) aoView = filtered;
+                    }
                     WGPUTexture colorTex = aurora_get_color_texture();
                     self->m_compositePass.execute(device, encoder, colorTex,
-                                                  self->m_aoPass.ao_texture_view(),
-                                                  self->m_aoStrength);
+                                                  aoView, self->m_aoStrength);
                 }
             }
         }, this);
