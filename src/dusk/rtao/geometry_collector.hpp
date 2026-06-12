@@ -6,6 +6,7 @@
 
 struct AuroraGxCaptureDraw;
 
+
 namespace dusk::rtao {
 
 class GeometryCollector {
@@ -67,6 +68,18 @@ public:
     // A good default is 3× the AO ray length.  Pass 0 to disable.
     void set_max_edge_length(float len) { m_maxEdgeLen = len; }
 
+    // Optional per-draw callback, fired for each qualifying draw call after the
+    // projection/viewport/skybox filters.  Used to feed the BLAS cache without
+    // introducing a webgpu header dependency into the test-linked geometry collector.
+    using DrawCallback = void (*)(const AuroraGxCaptureDraw&, void* userdata);
+    void set_draw_callback(DrawCallback cb, void* userdata) {
+        m_drawCb = cb; m_drawCbUserdata = userdata;
+    }
+
+    // Diagnostic: total number of times the draw callback was actually invoked.
+    // Accumulates forever (never reset).  If this stays 0, the callback is null.
+    uint32_t draw_callback_fired_total() const { return m_drawCbFiredTotal; }
+
     void simulate_draw(const AuroraGxCaptureDraw& draw);
 
 private:
@@ -96,6 +109,10 @@ private:
     std::unordered_map<void*, uint32_t> m_texViewToSlot;
     std::vector<void*>                  m_textureViews;
     uint32_t                            m_totalAlphaTexCount = 0;
+
+    DrawCallback m_drawCb         = nullptr;
+    void*        m_drawCbUserdata = nullptr;
+    uint32_t     m_drawCbFiredTotal = 0;
 
     static constexpr uint32_t kMaxTriangles = 500'000;
     static constexpr uint32_t kMaxTexSlots  = 16;

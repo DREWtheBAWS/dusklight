@@ -37,7 +37,7 @@ static_assert(sizeof(GpuTriangle) == 80);
 
 // 112 bytes — matches WGSL Camera uniform
 struct GpuCamera {
-    float    invViewProj[16]; // col-major mat4x4 = inv(VP), offset 0
+    float    invViewProj[16]; // col-major mat4x4 = inv(P), offset 0; unprojects NDC → view space
     uint32_t screenWidth;     // offset 64
     uint32_t screenHeight;    // offset 68
     uint32_t raysPerPixel;    // offset 72
@@ -46,7 +46,7 @@ struct GpuCamera {
     float    normalBias;      // offset 84
     uint32_t debugMode;       // offset 88  0=AO,1=normals,2=depth,3=root-AABB
     uint32_t debugMode2;      // offset 92  0=limit-hits,1=AO,2=normals,3=depth,4=root-AABB
-    float    camWorldX;       // offset 96  camera world position (for world-space AO)
+    float    camWorldX;       // offset 96  (unused in view-space BVH, kept for struct alignment)
     float    camWorldY;       // offset 100
     float    camWorldZ;       // offset 104
     uint32_t _pad2;           // offset 108
@@ -341,27 +341,39 @@ fn unproject(px: u32, py: u32) -> vec4<f32> {
 // ---- Normal estimation from depth-buffer gradients ----
 
 fn estimate_normal(px: u32, py: u32, pos: vec3<f32>) -> vec3<f32> {
-    let W = cam.screen_width;
-    let H = cam.screen_height;
-    // Use the two neighbors that avoid going out of bounds
-    let px1 = select(px + 1u, px - 1u, px + 1u >= W);
-    let py1 = select(py + 1u, py - 1u, py + 1u >= H);
-    let sx   = select(1.0, -1.0, px + 1u >= W);
-    let sy   = select(1.0, -1.0, py + 1u >= H);
+    let W = cam.screen_width; let H = cam.screen_height;
+    // Sample all 4 axis-aligned neighbors; for each axis pick the one on the same
+    // surface (no depth discontinuity) to avoid wrong normals at mesh silhouettes.
+    let d0     = length(pos);
+    let thresh = max(d0 * 0.15, 0.1);
 
-    let p1 = unproject(px1, py);
-    let p2 = unproject(px,  py1);
-    if (p1.w < 0.5 || p2.w < 0.5) { return vec3<f32>(0.0, 1.0, 0.0); }
+    let xp = unproject(select(px + 1u, px - 1u, px + 1u >= W), py);
+    let xn = unproject(select(px - 1u, px + 1u, px == 0u),     py);
+    let yp = unproject(px, select(py + 1u, py - 1u, py + 1u >= H));
+    let yn = unproject(px, select(py - 1u, py + 1u, py == 0u));
 
-    let dx = (p1.xyz - pos) * sx;
-    let dy = (p2.xyz - pos) * sy;
-    let n  = cross(dx, dy);
+    let xp_ok = xp.w > 0.5 && abs(length(xp.xyz) - d0) < thresh && (px + 1u < W);
+    let xn_ok = xn.w > 0.5 && abs(length(xn.xyz) - d0) < thresh && (px > 0u);
+    let yp_ok = yp.w > 0.5 && abs(length(yp.xyz) - d0) < thresh && (py + 1u < H);
+    let yn_ok = yn.w > 0.5 && abs(length(yn.xyz) - d0) < thresh && (py > 0u);
+
+    // Pick best tangent for each axis; return camera-facing fallback at silhouettes.
+    var tx: vec3<f32>;
+    if      (xp_ok) { tx = xp.xyz - pos; }
+    else if (xn_ok) { tx = pos - xn.xyz; }
+    else            { return normalize(-pos); }
+
+    var ty: vec3<f32>;
+    if      (yp_ok) { ty = yp.xyz - pos; }
+    else if (yn_ok) { ty = pos - yn.xyz; }
+    else            { return normalize(-pos); }
+
+    let n  = cross(tx, ty);
     let nl = length(n);
-    if (nl < 1e-6) { return vec3<f32>(0.0, 1.0, 0.0); }
-    var n_norm = n / nl;
-    // Orient toward camera.  BVH and positions are in view space; camera is at origin.
-    if (dot(n_norm, normalize(-pos)) < 0.0) { n_norm = -n_norm; }
-    return n_norm;
+    if (nl < 1e-6) { return normalize(-pos); }
+    var nn = n / nl;
+    if (dot(nn, normalize(-pos)) < 0.0) { nn = -nn; }
+    return nn;
 }
 
 // ---- Main compute entry point ----
@@ -492,6 +504,357 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // ---------------------------------------------------------------------------
+// TLAS/BLAS two-level AO shader
+// ---------------------------------------------------------------------------
+
+static std::string build_tlas_ao_shader() {
+    std::string s;
+    s += R"(
+// ---- Structs ---------------------------------------------------------------
+// AcNode: shared 48-byte format for both TLAS and monolithic BLAS nodes.
+// Offsets match GpuNode on the CPU (BlasCache::GpuNode).
+struct AcNode {
+    bounds_min : vec3<f32>,  // offset 0
+    hit_next   : u32,        // offset 12  (0xFFFFFFFF = done)
+    bounds_max : vec3<f32>,  // offset 16
+    miss_next  : u32,        // offset 28
+    tri_offset : u32,        // offset 32  TLAS leaf: instance index; BLAS leaf: tri index (monolithic)
+    tri_count  : u32,        // offset 36  0=interior; TLAS leaf=1; BLAS leaf=tri count
+    _pad0      : u32,        // offset 40
+    _pad1      : u32,        // offset 44
+}
+
+// TlasInstance: 64 bytes, matches GpuTlasInstance on the CPU.
+struct TlasInstance {
+    pnMtxInv_r0     : vec4<f32>,   // offset 0   row 0 of view→local 3×4 matrix
+    pnMtxInv_r1     : vec4<f32>,   // offset 16  row 1
+    pnMtxInv_r2     : vec4<f32>,   // offset 32  row 2
+    blas_node_offset: u32,          // offset 48  (informational, already baked into node indices)
+    blas_tri_offset : u32,          // offset 52  (informational, already baked into tri_offset)
+    blas_node_count : u32,          // offset 56
+    blas_tri_count  : u32,          // offset 60
+}
+
+// BlasTri: 48 bytes (positions only; UVs deferred to Phase 3b).
+struct BlasTri {
+    v0 : vec4<f32>,  // xyz = local-space position, w = pad
+    v1 : vec4<f32>,
+    v2 : vec4<f32>,
+}
+
+// Camera UBO: identical to the LBVH shader's Camera struct.
+struct Camera {
+    inv_view_proj : mat4x4<f32>,
+    screen_width  : u32,
+    screen_height : u32,
+    rays_per_pixel: u32,
+    frame_seed    : u32,
+    max_distance  : f32,
+    normal_bias   : f32,
+    debug_mode    : u32,
+    debug_mode2   : u32,
+    cam_world_x   : f32,
+    cam_world_y   : f32,
+    cam_world_z   : f32,
+    _pad2         : u32,
+}
+
+// ---- Bindings ---------------------------------------------------------------
+@group(0) @binding(0) var<storage, read> tlas_nodes     : array<AcNode>;
+@group(0) @binding(1) var<storage, read> tlas_instances : array<TlasInstance>;
+@group(0) @binding(2) var<uniform>       cam            : Camera;
+@group(0) @binding(3) var               t_depth        : texture_depth_2d;
+@group(0) @binding(4) var               ao_out         : texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(5) var               limits_out     : texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(6) var               s_alpha        : sampler;
+@group(0) @binding(7) var<storage, read> blas_nodes     : array<AcNode>;
+@group(0) @binding(8) var<storage, read> blas_tris      : array<BlasTri>;
+)";
+    // Alpha textures: same 16 slots as LBVH for future UV support.
+    for (int i = 0; i < 16; ++i) {
+        s += "@group(0) @binding(";
+        s += std::to_string(9 + i);
+        s += ") var t_alpha_";
+        s += std::to_string(i);
+        s += " : texture_2d<f32>;\n";
+    }
+    s += R"(
+
+// ---- PCG RNG ----------------------------------------------------------------
+fn pcg(v: u32) -> u32 {
+    let s = v * 747796405u + 2891336453u;
+    let w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+fn rand_f(seed: ptr<function, u32>) -> f32 {
+    *seed = pcg(*seed);
+    return f32(*seed) / 4294967295.0;
+}
+
+// ---- Cosine-weighted hemisphere sample ----
+fn cosine_hemisphere(normal: vec3<f32>, seed: ptr<function, u32>) -> vec3<f32> {
+    let r1 = rand_f(seed);
+    let r2 = rand_f(seed);
+    let phi = 6.2831853 * r1;
+    let sr2 = sqrt(r2);
+    let lx  = cos(phi) * sr2;
+    let ly  = sin(phi) * sr2;
+    let lz  = sqrt(max(0.0, 1.0 - r2));
+    var up = vec3<f32>(0.0, 1.0, 0.0);
+    if (abs(normal.y) > 0.99) { up = vec3<f32>(1.0, 0.0, 0.0); }
+    let tangent   = normalize(cross(up, normal));
+    let bitangent = cross(normal, tangent);
+    return lx * tangent + ly * bitangent + lz * normal;
+}
+
+// ---- AABB slab test (works for both TLAS view-space and BLAS local-space) ----
+fn aabb_hit(node: AcNode, origin: vec3<f32>, inv_dir: vec3<f32>, tmax: f32) -> bool {
+    let t1 = (node.bounds_min - origin) * inv_dir;
+    let t2 = (node.bounds_max - origin) * inv_dir;
+    let tmin_v = min(t1, t2);
+    let tmax_v = max(t1, t2);
+    let tmin_s = max(max(tmin_v.x, tmin_v.y), max(tmin_v.z, 0.0));
+    let tmax_s = min(min(tmax_v.x, tmax_v.y), min(tmax_v.z, tmax));
+    return tmin_s <= tmax_s;
+}
+
+// ---- Ray transform into instance local space ----
+// pnMtxInv is stored as three vec4 rows of a 3×4 affine matrix.
+fn xf_point(inst: TlasInstance, p: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(
+        dot(inst.pnMtxInv_r0, vec4<f32>(p, 1.0)),
+        dot(inst.pnMtxInv_r1, vec4<f32>(p, 1.0)),
+        dot(inst.pnMtxInv_r2, vec4<f32>(p, 1.0))
+    );
+}
+fn xf_dir(inst: TlasInstance, d: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(
+        dot(inst.pnMtxInv_r0.xyz, d),
+        dot(inst.pnMtxInv_r1.xyz, d),
+        dot(inst.pnMtxInv_r2.xyz, d)
+    );
+}
+
+// ---- BLAS triangle intersection (position only, no alpha) ----
+// The t-parameter is the same in both view space and local space (it's the
+// ray parameter, not a distance), so tmax can be passed through unchanged.
+fn blas_ray_tri_hit(origin: vec3<f32>, dir: vec3<f32>, tri: BlasTri, tmax: f32) -> bool {
+    let e1 = tri.v1.xyz - tri.v0.xyz;
+    let e2 = tri.v2.xyz - tri.v0.xyz;
+    let h  = cross(dir, e2);
+    let det = dot(e1, h);
+    if (abs(det) < 1e-7) { return false; }
+    let inv_det = 1.0 / det;
+    let sv = origin - tri.v0.xyz;
+    let u = dot(sv, h) * inv_det;
+    if (u < 0.0 || u > 1.0) { return false; }
+    let q = cross(sv, e1);
+    let v = dot(dir, q) * inv_det;
+    if (v < 0.0 || u + v > 1.0) { return false; }
+    let t = dot(e2, q) * inv_det;
+    return (t > 1e-4 && t < tmax);
+}
+
+// ---- Stackless BLAS traversal in local space ----
+// Node indices in blas_nodes are already absolute (monolithic buffer offsets
+// were baked in at build time).
+//
+// Per-BLAS visit cap is independent of the TLAS cap so a single complex BLAS
+// cannot exhaust the budget for remaining TLAS instances in the same ray.
+// Returns 0=miss, 1=hit, 2=blas-visit-limit reached.
+const kMaxTlasVisits: u32 = 1024u;  // TLAS-level node budget per ray
+const kMaxBlasVisits: u32 = 2048u;  // per-BLAS node budget (each leaf capped separately)
+
+fn traverse_blas(inst: TlasInstance, l_origin: vec3<f32>, l_dir: vec3<f32>,
+                 tmax: f32, heat_acc: ptr<function, u32>) -> u32 {
+    let inv_dir = vec3<f32>(1.0/l_dir.x, 1.0/l_dir.y, 1.0/l_dir.z);
+    var idx: u32 = inst.blas_node_offset;
+    var local_v: u32 = 0u;
+    loop {
+        if (idx == 0xFFFFFFFFu) { break; }
+        if (local_v >= kMaxBlasVisits) { *heat_acc += local_v; return 2u; }
+        local_v += 1u;
+        let node = blas_nodes[idx];
+        if (!aabb_hit(node, l_origin, inv_dir, tmax)) {
+            idx = node.miss_next; continue;
+        }
+        if (node.tri_count > 0u) {
+            for (var i = node.tri_offset; i < node.tri_offset + node.tri_count; i += 1u) {
+                if (blas_ray_tri_hit(l_origin, l_dir, blas_tris[i], tmax)) {
+                    *heat_acc += local_v; return 1u;
+                }
+            }
+            idx = node.miss_next;
+        } else {
+            idx = node.hit_next;
+        }
+    }
+    *heat_acc += local_v;
+    return 0u;
+}
+
+// ---- Two-level TLAS traversal (view space) ----
+// Returns 0=miss, 1=hit, 2=visit-limit reached.
+fn intersects_any(origin: vec3<f32>, dir: vec3<f32>, tmax: f32,
+                  acc_visits: ptr<function, u32>) -> u32 {
+    if (arrayLength(&tlas_nodes) == 0u || arrayLength(&tlas_instances) == 0u) { return 0u; }
+    let inv_dir = vec3<f32>(1.0/dir.x, 1.0/dir.y, 1.0/dir.z);
+    var idx: u32 = 0u;
+    var tlas_v: u32 = 0u;
+    loop {
+        if (idx == 0xFFFFFFFFu) { break; }
+        if (tlas_v >= kMaxTlasVisits) { *acc_visits += tlas_v; return 2u; }
+        tlas_v += 1u;
+        let node = tlas_nodes[idx];
+        if (!aabb_hit(node, origin, inv_dir, tmax)) {
+            idx = node.miss_next; continue;
+        }
+        if (node.tri_count == 1u) {  // TLAS leaf
+            let inst = tlas_instances[node.tri_offset];
+            let l_origin = xf_point(inst, origin);
+            let l_dir    = xf_dir(inst, dir);
+            let r = traverse_blas(inst, l_origin, l_dir, tmax, acc_visits);
+            if (r == 1u) { *acc_visits += tlas_v; return 1u; }
+            // r==2 means this BLAS hit its own cap; don't penalise the whole ray —
+            // mark as limit only if the TLAS budget itself is also exhausted.
+            idx = node.miss_next;
+        } else {
+            idx = node.hit_next;
+        }
+    }
+    *acc_visits += tlas_v;
+    return 0u;
+}
+
+// ---- Depth / unproject / normal (identical to LBVH shader) ----
+fn load_depth(px: u32, py: u32) -> f32 { return -textureLoad(t_depth, vec2<i32>(i32(px), i32(py)), 0); }
+
+fn unproject(px: u32, py: u32) -> vec4<f32> {
+    let d = load_depth(px, py);
+    let ndc_x = (f32(px) + 0.5) / f32(cam.screen_width)  *  2.0 - 1.0;
+    let ndc_y = (f32(py) + 0.5) / f32(cam.screen_height) * -2.0 + 1.0;
+    let ndc_h = vec4<f32>(ndc_x, ndc_y, d, 1.0);
+    let world_h = ndc_h * cam.inv_view_proj;
+    if (abs(world_h.w) < 1e-6) { return vec4<f32>(0.0, 0.0, 0.0, 0.0); }
+    return vec4<f32>(world_h.xyz / world_h.w, 1.0);
+}
+
+fn estimate_normal(px: u32, py: u32, pos: vec3<f32>) -> vec3<f32> {
+    let W = cam.screen_width; let H = cam.screen_height;
+    let d0     = length(pos);
+    let thresh = max(d0 * 0.15, 0.1);
+
+    let xp = unproject(select(px + 1u, px - 1u, px + 1u >= W), py);
+    let xn = unproject(select(px - 1u, px + 1u, px == 0u),     py);
+    let yp = unproject(px, select(py + 1u, py - 1u, py + 1u >= H));
+    let yn = unproject(px, select(py - 1u, py + 1u, py == 0u));
+
+    let xp_ok = xp.w > 0.5 && abs(length(xp.xyz) - d0) < thresh && (px + 1u < W);
+    let xn_ok = xn.w > 0.5 && abs(length(xn.xyz) - d0) < thresh && (px > 0u);
+    let yp_ok = yp.w > 0.5 && abs(length(yp.xyz) - d0) < thresh && (py + 1u < H);
+    let yn_ok = yn.w > 0.5 && abs(length(yn.xyz) - d0) < thresh && (py > 0u);
+
+    var tx: vec3<f32>;
+    if      (xp_ok) { tx = xp.xyz - pos; }
+    else if (xn_ok) { tx = pos - xn.xyz; }
+    else            { return normalize(-pos); }
+
+    var ty: vec3<f32>;
+    if      (yp_ok) { ty = yp.xyz - pos; }
+    else if (yn_ok) { ty = pos - yn.xyz; }
+    else            { return normalize(-pos); }
+
+    let n  = cross(tx, ty);
+    let nl = length(n);
+    if (nl < 1e-6) { return normalize(-pos); }
+    var nn = n / nl;
+    if (dot(nn, normalize(-pos)) < 0.0) { nn = -nn; }
+    return nn;
+}
+
+// ---- Main compute entry point ----
+@compute @workgroup_size(8, 8)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let px = gid.x * 2u;
+    let py = gid.y * 2u;
+    if (px >= cam.screen_width || py >= cam.screen_height) { return; }
+
+    let W = i32(cam.screen_width); let H = i32(cam.screen_height);
+    let c00 = vec2<i32>(i32(px),   i32(py));
+    let c10 = vec2<i32>(i32(px)+1, i32(py));
+    let c01 = vec2<i32>(i32(px),   i32(py)+1);
+    let c11 = vec2<i32>(i32(px)+1, i32(py)+1);
+
+    let d = textureLoad(t_depth, vec2<i32>(i32(px), i32(py)), 0);
+    if (d <= 0.0001) {
+        let sky = vec4<f32>(1.0, 0.0, 0.0, 1.0);
+        let blk = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        textureStore(ao_out,    c00, sky); textureStore(ao_out,    c10, sky);
+        textureStore(ao_out,    c01, sky); textureStore(ao_out,    c11, sky);
+        textureStore(limits_out, c00, blk); textureStore(limits_out, c10, blk);
+        textureStore(limits_out, c01, blk); textureStore(limits_out, c11, blk);
+        return;
+    }
+
+    let pos_h = unproject(px, py);
+    if (pos_h.w < 0.5) {
+        let bad = vec4<f32>(0.0, 0.0, 1.0, 1.0);
+        textureStore(ao_out,    c00, bad); textureStore(ao_out,    c10, bad);
+        textureStore(ao_out,    c01, bad); textureStore(ao_out,    c11, bad);
+        textureStore(limits_out, c00, bad); textureStore(limits_out, c10, bad);
+        textureStore(limits_out, c01, bad); textureStore(limits_out, c11, bad);
+        return;
+    }
+    let pos    = pos_h.xyz;
+    let normal = estimate_normal(px, py, pos);
+
+    let dist_from_cam = length(pos);
+    let ray_origin = pos + normal * max(dist_from_cam * cam.normal_bias, cam.normal_bias * 10.0);
+    var seed = pcg(((py * cam.screen_width + px) * 1664525u) ^ cam.frame_seed);
+    var hits: u32 = 0u; var limit_hits: u32 = 0u; var total_visits: u32 = 0u;
+    let N = cam.rays_per_pixel;
+    for (var i = 0u; i < N; i += 1u) {
+        let dir = cosine_hemisphere(normal, &seed);
+        let r = intersects_any(ray_origin, dir, cam.max_distance, &total_visits);
+        if (r == 1u) { hits       += 1u; }
+        if (r == 2u) { limit_hits += 1u; }
+    }
+
+    let valid = N - limit_hits;
+    let ao = select(0.5, 1.0 - f32(hits) / f32(valid), valid > 0u);
+
+    let root = tlas_nodes[0];
+    let root_hit = aabb_hit(root, pos, vec3<f32>(1.0/0.1, 1.0/0.1, 1.0/(-1.0)), cam.max_distance);
+
+    var ao_val: vec4<f32>;
+    if (cam.debug_mode == 1u)      { ao_val = vec4<f32>(normal * 0.5 + 0.5, 1.0); }
+    else if (cam.debug_mode == 2u) { ao_val = vec4<f32>(dist_from_cam / 2000.0, 0.0, 0.0, 1.0); }
+    else if (cam.debug_mode == 3u) { ao_val = select(vec4<f32>(1.0,0.0,0.0,1.0), vec4<f32>(0.0,1.0,0.0,1.0), root_hit); }
+    else                           { ao_val = vec4<f32>(ao, ao, ao, 1.0); }
+
+    var lim_val: vec4<f32>;
+    if (cam.debug_mode2 == 1u)      { lim_val = vec4<f32>(ao, ao, ao, 1.0); }
+    else if (cam.debug_mode2 == 2u) { lim_val = vec4<f32>(normal * 0.5 + 0.5, 1.0); }
+    else if (cam.debug_mode2 == 3u) { lim_val = vec4<f32>(dist_from_cam / 2000.0, 0.0, 0.0, 1.0); }
+    else if (cam.debug_mode2 == 4u) { lim_val = select(vec4<f32>(1.0,0.0,0.0,1.0), vec4<f32>(0.0,1.0,0.0,1.0), root_hit); }
+    else if (cam.debug_mode2 == 5u) { lim_val = vec4<f32>(min(f32(total_visits) / f32(N * 256u), 1.0), 0.0, 0.0, 1.0); }
+    else if (cam.debug_mode2 == 6u) { lim_val = vec4<f32>(f32(limit_hits)/f32(N), 0.0, f32(limit_hits)/f32(N), 1.0); }
+    else                            { lim_val = select(vec4<f32>(0.0,0.0,0.0,1.0), vec4<f32>(1.0,0.0,1.0,1.0), limit_hits > N/2u); }
+
+    textureStore(ao_out, c00, ao_val);
+    if (c10.x < W) { textureStore(ao_out, c10, ao_val); }
+    if (c01.y < H) { textureStore(ao_out, c01, ao_val); }
+    if (c10.x < W && c01.y < H) { textureStore(ao_out, c11, ao_val); }
+    textureStore(limits_out, c00, lim_val);
+    if (c10.x < W) { textureStore(limits_out, c10, lim_val); }
+    if (c01.y < H) { textureStore(limits_out, c01, lim_val); }
+    if (c10.x < W && c01.y < H) { textureStore(limits_out, c11, lim_val); }
+}
+)";
+    return s;
+}
+
+// ---------------------------------------------------------------------------
 // WebGPU helpers
 // ---------------------------------------------------------------------------
 
@@ -515,18 +878,21 @@ static WGPUBuffer create_buffer(WGPUDevice device, uint64_t size, WGPUBufferUsag
 // ---------------------------------------------------------------------------
 
 AoPass::~AoPass() {
-    if (m_bindGroup)   wgpuBindGroupRelease(m_bindGroup);
-    if (m_depthView)   wgpuTextureViewRelease(m_depthView);
-    if (m_limView)     wgpuTextureViewRelease(m_limView);
-    if (m_limTex)      wgpuTextureRelease(m_limTex);
-    if (m_aoView)      wgpuTextureViewRelease(m_aoView);
-    if (m_aoTex)       wgpuTextureRelease(m_aoTex);
-    if (m_fallbackView) wgpuTextureViewRelease(m_fallbackView);
-    if (m_fallbackTex)  wgpuTextureRelease(m_fallbackTex);
-    if (m_alphaSampler) wgpuSamplerRelease(m_alphaSampler);
-    if (m_cameraUbo)   wgpuBufferRelease(m_cameraUbo);
-    if (m_bgl)         wgpuBindGroupLayoutRelease(m_bgl);
-    if (m_pipeline)    wgpuComputePipelineRelease(m_pipeline);
+    if (m_tlasBindGroup)  wgpuBindGroupRelease(m_tlasBindGroup);
+    if (m_tlasBgl)        wgpuBindGroupLayoutRelease(m_tlasBgl);
+    if (m_tlasPipeline)   wgpuComputePipelineRelease(m_tlasPipeline);
+    if (m_bindGroup)      wgpuBindGroupRelease(m_bindGroup);
+    if (m_depthView)      wgpuTextureViewRelease(m_depthView);
+    if (m_limView)        wgpuTextureViewRelease(m_limView);
+    if (m_limTex)         wgpuTextureRelease(m_limTex);
+    if (m_aoView)         wgpuTextureViewRelease(m_aoView);
+    if (m_aoTex)          wgpuTextureRelease(m_aoTex);
+    if (m_fallbackView)   wgpuTextureViewRelease(m_fallbackView);
+    if (m_fallbackTex)    wgpuTextureRelease(m_fallbackTex);
+    if (m_alphaSampler)   wgpuSamplerRelease(m_alphaSampler);
+    if (m_cameraUbo)      wgpuBufferRelease(m_cameraUbo);
+    if (m_bgl)            wgpuBindGroupLayoutRelease(m_bgl);
+    if (m_pipeline)       wgpuComputePipelineRelease(m_pipeline);
 }
 
 void AoPass::ensure_pipeline(WGPUDevice device) {
@@ -607,6 +973,109 @@ void AoPass::ensure_pipeline(WGPUDevice device) {
     wgpuShaderModuleRelease(sm);
 }
 
+void AoPass::ensure_tlas_pipeline(WGPUDevice device) {
+    if (m_tlasPipeline) return;
+
+    const std::string src = build_tlas_ao_shader();
+    WGPUShaderSourceWGSL wgslSrc{};
+    wgslSrc.chain.sType = WGPUSType_ShaderSourceWGSL;
+    wgslSrc.code        = {src.c_str(), WGPU_STRLEN};
+    WGPUShaderModuleDescriptor smDesc{};
+    smDesc.nextInChain = &wgslSrc.chain;
+    WGPUShaderModule sm = wgpuDeviceCreateShaderModule(device, &smDesc);
+
+    // 9 fixed bindings (0-8) + 1 sampler (6) + 16 alpha textures (9-24) = 25 total
+    WGPUBindGroupLayoutEntry entries[25] = {};
+
+    // 0: TLAS nodes
+    entries[0].binding = 0; entries[0].visibility = WGPUShaderStage_Compute;
+    entries[0].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
+    // 1: TLAS instances
+    entries[1].binding = 1; entries[1].visibility = WGPUShaderStage_Compute;
+    entries[1].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
+    // 2: Camera UBO
+    entries[2].binding = 2; entries[2].visibility = WGPUShaderStage_Compute;
+    entries[2].buffer.type = WGPUBufferBindingType_Uniform;
+    // 3: Depth texture
+    entries[3].binding = 3; entries[3].visibility = WGPUShaderStage_Compute;
+    entries[3].texture.sampleType    = WGPUTextureSampleType_Depth;
+    entries[3].texture.viewDimension = WGPUTextureViewDimension_2D;
+    // 4: AO output
+    entries[4].binding = 4; entries[4].visibility = WGPUShaderStage_Compute;
+    entries[4].storageTexture.access        = WGPUStorageTextureAccess_WriteOnly;
+    entries[4].storageTexture.format        = WGPUTextureFormat_RGBA8Unorm;
+    entries[4].storageTexture.viewDimension = WGPUTextureViewDimension_2D;
+    // 5: Limits output
+    entries[5].binding = 5; entries[5].visibility = WGPUShaderStage_Compute;
+    entries[5].storageTexture.access        = WGPUStorageTextureAccess_WriteOnly;
+    entries[5].storageTexture.format        = WGPUTextureFormat_RGBA8Unorm;
+    entries[5].storageTexture.viewDimension = WGPUTextureViewDimension_2D;
+    // 6: Sampler
+    entries[6].binding = 6; entries[6].visibility = WGPUShaderStage_Compute;
+    entries[6].sampler.type = WGPUSamplerBindingType_Filtering;
+    // 7: Monolithic BLAS nodes
+    entries[7].binding = 7; entries[7].visibility = WGPUShaderStage_Compute;
+    entries[7].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
+    // 8: Monolithic BLAS tris
+    entries[8].binding = 8; entries[8].visibility = WGPUShaderStage_Compute;
+    entries[8].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
+    // 9-24: Alpha textures
+    for (int i = 0; i < 16; ++i) {
+        entries[9 + i].binding               = 9 + i;
+        entries[9 + i].visibility            = WGPUShaderStage_Compute;
+        entries[9 + i].texture.sampleType    = WGPUTextureSampleType_Float;
+        entries[9 + i].texture.viewDimension = WGPUTextureViewDimension_2D;
+    }
+
+    WGPUBindGroupLayoutDescriptor bglDesc{};
+    bglDesc.entryCount = 25;
+    bglDesc.entries    = entries;
+    m_tlasBgl = wgpuDeviceCreateBindGroupLayout(device, &bglDesc);
+
+    WGPUPipelineLayoutDescriptor plDesc{};
+    plDesc.bindGroupLayoutCount = 1;
+    plDesc.bindGroupLayouts     = &m_tlasBgl;
+    WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(device, &plDesc);
+
+    WGPUComputePipelineDescriptor cpDesc{};
+    cpDesc.layout             = pl;
+    cpDesc.compute.module     = sm;
+    cpDesc.compute.entryPoint = {"cs_main", WGPU_STRLEN};
+    m_tlasPipeline = wgpuDeviceCreateComputePipeline(device, &cpDesc);
+
+    wgpuPipelineLayoutRelease(pl);
+    wgpuShaderModuleRelease(sm);
+}
+
+void AoPass::rebuild_tlas_bind_group(WGPUDevice device) {
+    if (m_tlasBindGroup) { wgpuBindGroupRelease(m_tlasBindGroup); m_tlasBindGroup = nullptr; }
+
+    WGPUBindGroupEntry entries[25] = {};
+    entries[0].binding = 0; entries[0].buffer = m_tlasLastNodeBuf;     entries[0].size = WGPU_WHOLE_SIZE;
+    entries[1].binding = 1; entries[1].buffer = m_tlasLastInstBuf;     entries[1].size = WGPU_WHOLE_SIZE;
+    entries[2].binding = 2; entries[2].buffer = m_cameraUbo;           entries[2].size = sizeof(GpuCamera);
+    entries[3].binding = 3; entries[3].textureView = m_depthView;
+    entries[4].binding = 4; entries[4].textureView = m_aoView;
+    entries[5].binding = 5; entries[5].textureView = m_limView;
+    entries[6].binding = 6; entries[6].sampler = m_alphaSampler;
+    entries[7].binding = 7; entries[7].buffer = m_tlasLastBlasNodeBuf; entries[7].size = WGPU_WHOLE_SIZE;
+    entries[8].binding = 8; entries[8].buffer = m_tlasLastBlasTriBuf;  entries[8].size = WGPU_WHOLE_SIZE;
+    for (int i = 0; i < 16; ++i) {
+        entries[9 + i].binding = 9 + i;
+        entries[9 + i].textureView =
+            (i < static_cast<int>(m_lastTexViews.size()))
+            ? static_cast<WGPUTextureView>(m_lastTexViews[i])
+            : m_fallbackView;
+    }
+
+    WGPUBindGroupDescriptor bgd{};
+    bgd.layout     = m_tlasBgl;
+    bgd.entryCount = 25;
+    bgd.entries    = entries;
+    m_tlasBindGroup      = wgpuDeviceCreateBindGroup(device, &bgd);
+    m_tlasBindGroupDirty = false;
+}
+
 void AoPass::rebuild_output(WGPUDevice device, uint32_t w, uint32_t h) {
     if (m_aoView)  { wgpuTextureViewRelease(m_aoView);  m_aoView  = nullptr; }
     if (m_aoTex)   { wgpuTextureRelease(m_aoTex);       m_aoTex   = nullptr; }
@@ -643,7 +1112,8 @@ void AoPass::rebuild_depth_binding(WGPUDevice device, WGPUTexture depthTex) {
     dvd.aspect          = WGPUTextureAspect_DepthOnly;
     m_depthView    = wgpuTextureCreateView(depthTex, &dvd);
     m_lastDepthTex = depthTex;
-    m_bindGroupDirty = true;
+    m_bindGroupDirty     = true;
+    m_tlasBindGroupDirty = true;
 }
 
 void AoPass::rebuild_bind_group(WGPUDevice device) {
@@ -720,7 +1190,6 @@ void AoPass::execute(WGPUDevice device, WGPUCommandEncoder encoder,
     gpuCam.debugMode     = m_params.debugMode;
     gpuCam.debugMode2    = m_params.debugMode2;
     if (!compute_inv_proj(cam, gpuCam.invViewProj)) return;
-    // BVH triangles and depth are in view space; camera is at the origin.
     gpuCam.camWorldX = 0.f;
     gpuCam.camWorldY = 0.f;
     gpuCam.camWorldZ = 0.f;
@@ -779,6 +1248,100 @@ void AoPass::execute(WGPUDevice device, WGPUCommandEncoder encoder,
     wgpuComputePassEncoderSetPipeline(pass, m_pipeline);
     wgpuComputePassEncoderSetBindGroup(pass, 0, m_bindGroup, 0, nullptr);
     // Half-resolution dispatch — each thread writes a 2×2 block (4× work reduction).
+    const uint32_t gx = (w / 2 + 7) / 8;
+    const uint32_t gy = (h / 2 + 7) / 8;
+    wgpuComputePassEncoderDispatchWorkgroups(pass, gx, gy, 1);
+    wgpuComputePassEncoderEnd(pass);
+    wgpuComputePassEncoderRelease(pass);
+}
+
+void AoPass::execute_tlas(WGPUDevice device, WGPUCommandEncoder encoder,
+                          WGPUTexture depthTex,
+                          const GeometryCollector::CameraData& cam,
+                          WGPUBuffer tlasNodeBuf, WGPUBuffer instanceBuf,
+                          WGPUBuffer blasNodeBuf, WGPUBuffer blasTriBuf,
+                          const std::vector<void*>& texViews) {
+    if (!cam.valid || !depthTex) return;
+    if (!tlasNodeBuf || !instanceBuf || !blasNodeBuf || !blasTriBuf) return;
+
+    if (tlasNodeBuf != m_tlasLastNodeBuf || instanceBuf != m_tlasLastInstBuf ||
+        blasNodeBuf != m_tlasLastBlasNodeBuf || blasTriBuf != m_tlasLastBlasTriBuf) {
+        m_tlasLastNodeBuf     = tlasNodeBuf;
+        m_tlasLastInstBuf     = instanceBuf;
+        m_tlasLastBlasNodeBuf = blasNodeBuf;
+        m_tlasLastBlasTriBuf  = blasTriBuf;
+        m_tlasBindGroupDirty  = true;
+    }
+    if (texViews != m_lastTexViews) {
+        m_lastTexViews       = texViews;
+        m_tlasBindGroupDirty = true;
+        m_bindGroupDirty     = true; // also invalidate LBVH bind group
+    }
+
+    const uint32_t w = wgpuTextureGetWidth(depthTex);
+    const uint32_t h = wgpuTextureGetHeight(depthTex);
+    if (w == 0 || h == 0) return;
+
+    ensure_tlas_pipeline(device);
+    if (!m_tlasPipeline) return;
+
+    if (w != m_width || h != m_height) rebuild_output(device, w, h);
+    if (depthTex != m_lastDepthTex)    rebuild_depth_binding(device, depthTex);
+
+    // Upload camera UBO (shared with LBVH path).
+    GpuCamera gpuCam{};
+    gpuCam.screenWidth  = w;
+    gpuCam.screenHeight = h;
+    gpuCam.raysPerPixel = m_params.raysPerPixel;
+    gpuCam.frameSeed    = m_frame++;
+    gpuCam.maxDistance  = m_params.maxDistance;
+    gpuCam.normalBias   = m_params.normalBias;
+    gpuCam.debugMode    = m_params.debugMode;
+    gpuCam.debugMode2   = m_params.debugMode2;
+    if (!compute_inv_proj(cam, gpuCam.invViewProj)) return;
+
+    if (!m_cameraUbo) {
+        m_cameraUbo = create_buffer(device, sizeof(GpuCamera), WGPUBufferUsage_Uniform);
+        m_tlasBindGroupDirty = true;
+        m_bindGroupDirty     = true;
+    }
+    if (!m_alphaSampler) {
+        WGPUSamplerDescriptor sd{};
+        sd.addressModeU = WGPUAddressMode_Repeat; sd.addressModeV = WGPUAddressMode_Repeat;
+        sd.minFilter = WGPUFilterMode_Linear;     sd.magFilter = WGPUFilterMode_Linear;
+        sd.mipmapFilter = WGPUMipmapFilterMode_Nearest; sd.maxAnisotropy = 1;
+        m_alphaSampler = wgpuDeviceCreateSampler(device, &sd);
+        m_tlasBindGroupDirty = true;
+        m_bindGroupDirty     = true;
+    }
+    if (!m_fallbackTex) {
+        WGPUTextureDescriptor ftd{};
+        ftd.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+        ftd.dimension = WGPUTextureDimension_2D; ftd.size = {1,1,1};
+        ftd.format = WGPUTextureFormat_RGBA8Unorm; ftd.mipLevelCount = 1; ftd.sampleCount = 1;
+        m_fallbackTex  = wgpuDeviceCreateTexture(device, &ftd);
+        m_fallbackView = wgpuTextureCreateView(m_fallbackTex, nullptr);
+        const uint8_t white[4] = {255,255,255,255};
+        WGPUQueue fq = wgpuDeviceGetQueue(device);
+        WGPUTexelCopyTextureInfo ict{}; ict.texture = m_fallbackTex;
+        WGPUTexelCopyBufferLayout tdl{}; tdl.bytesPerRow = 4; tdl.rowsPerImage = 1;
+        WGPUExtent3D ext{1,1,1};
+        wgpuQueueWriteTexture(fq, &ict, white, 4, &tdl, &ext);
+        wgpuQueueRelease(fq);
+        m_tlasBindGroupDirty = true;
+        m_bindGroupDirty     = true;
+    }
+
+    WGPUQueue q = wgpuDeviceGetQueue(device);
+    wgpuQueueWriteBuffer(q, m_cameraUbo, 0, &gpuCam, sizeof(GpuCamera));
+    wgpuQueueRelease(q);
+
+    if (m_tlasBindGroupDirty) rebuild_tlas_bind_group(device);
+
+    WGPUComputePassDescriptor passDesc{};
+    WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(encoder, &passDesc);
+    wgpuComputePassEncoderSetPipeline(pass, m_tlasPipeline);
+    wgpuComputePassEncoderSetBindGroup(pass, 0, m_tlasBindGroup, 0, nullptr);
     const uint32_t gx = (w / 2 + 7) / 8;
     const uint32_t gy = (h / 2 + 7) / 8;
     wgpuComputePassEncoderDispatchWorkgroups(pass, gx, gy, 1);

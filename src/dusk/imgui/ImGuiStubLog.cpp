@@ -93,5 +93,7 @@ namespace dusk {
         std::lock_guard lock(StubLogMutex);
         ClearPastFrame();
         m_collector.end_frame();
+        m_blasCache.advance_frame();
+        m_tlasBuilder.advance_frame();
     }
 }

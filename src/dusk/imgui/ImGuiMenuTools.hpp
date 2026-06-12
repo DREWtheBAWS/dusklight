@@ -9,6 +9,8 @@
 #include "ImGuiSaveEditor.hpp"
 #include "ImGuiStateShare.hpp"
 #include "dusk/rtao/geometry_collector.hpp"
+#include "dusk/rtao/blas_cache.hpp"
+#include "dusk/rtao/tlas_builder.hpp"
 #include "dusk/rtao/depth_viewer.hpp"
 #include "dusk/rtao/ao_pass.hpp"
 #include "dusk/rtao/gpu_bvh_builder.hpp"
@@ -68,6 +70,9 @@ namespace dusk {
         bool m_buildBvhOnly    = false;  // debug: skip AO pass after BVH build
         bool m_bvhFrozen       = false;  // debug: stop rebuilding BVH each frame
         bool m_bvhCaptureOnce  = false;  // debug: do one rebuild then auto-freeze
+        bool m_useTlasBvh      = false;  // false=LBVH path, true=BLAS/TLAS path
+        dusk::rtao::BlasCache          m_blasCache;   // declared before m_collector (callback sets up pointer)
+        dusk::rtao::TlasBuilder        m_tlasBuilder;
         dusk::rtao::GeometryCollector  m_collector;
         dusk::rtao::DepthTextureViewer m_depthViewer;
         dusk::rtao::GpuBvhBuilder      m_bvhBuilder;

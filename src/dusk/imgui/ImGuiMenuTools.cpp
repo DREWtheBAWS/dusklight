@@ -32,17 +32,32 @@ extern bool enableLodBias;
 namespace dusk {
     ImGuiMenuTools::ImGuiMenuTools() {
         m_collector.install();
+        m_collector.set_draw_callback([](const AuroraGxCaptureDraw& draw, void* ud) {
+            static_cast<rtao::BlasCache*>(ud)->record_draw(draw);
+        }, &m_blasCache);
         aurora_set_post_render_callback([](WGPUDevice device, WGPUCommandEncoder encoder, void* userdata) {
             auto* self = static_cast<ImGuiMenuTools*>(userdata);
+
+            // Build new BLASes (SAH, local space) and upload to GPU.
+            // Runs unconditionally so the cache stays warm even when the LBVH is frozen.
+            self->m_blasCache.flush();
+
+            // Build the view-space TLAS over this frame's instances.
+            // Must run after m_blasCache.flush() so all BLAS entries are available.
+            self->m_tlasBuilder.build(self->m_blasCache);
+            self->m_tlasBuilder.flush(device);
+
             const bool doRebuild = !self->m_bvhFrozen || self->m_bvhCaptureOnce;
             if (doRebuild) {
-                // Rebuild the BVH from this frame's captured geometry (view space).
+                // Rebuild the LBVH from this frame's captured geometry (view space).
                 const auto& tris = self->m_collector.raw_triangles();
                 if (!tris.empty()) {
                     self->m_bvhBuilder.upload_triangles(device, tris);
-                    // build() records uploads + BVH passes + copy into Aurora's encoder
-                    // so every COPY_DST→* transition is handled within one command buffer.
-                    self->m_bvhBuilder.build(device, encoder);
+                    // build() creates its own encoder, submits it to the queue, and
+                    // returns.  The AO pass below runs in Aurora's encoder, which is
+                    // submitted after this callback returns — guaranteeing the BVH
+                    // writes are visible without relying on intra-command-buffer barriers.
+                    self->m_bvhBuilder.build(device);
 
                     // "Capture once" → freeze after this one rebuild
                     if (self->m_bvhCaptureOnce) {
@@ -52,17 +67,24 @@ namespace dusk {
                 }
             }
 
-            // AO pass always runs (if BVH was built at least once).
-            // Use pending_camera_data() (current frame, set during fifo::drain) rather
-            // than last_camera_data() (previous frame) to keep the projection matrix
-            // in sync with the depth buffer and the BVH triangles.
+            // AO pass: choose LBVH or BLAS/TLAS based on user toggle.
             WGPUTexture depthTex = aurora_get_depth_texture();
-            if (self->m_bvhBuilder.is_ready() && !self->m_buildBvhOnly) {
-                self->m_aoPass.execute(device, encoder, depthTex,
-                                       self->m_collector.pending_camera_data(),
-                                       self->m_bvhBuilder.node_buf(),
-                                       self->m_bvhBuilder.tri_buf(),
-                                       self->m_collector.texture_views());
+            const auto& camData  = self->m_collector.pending_camera_data();
+            const auto& texViews = self->m_collector.texture_views();
+            if (!self->m_buildBvhOnly) {
+                if (self->m_useTlasBvh && self->m_tlasBuilder.is_ready()) {
+                    self->m_aoPass.execute_tlas(device, encoder, depthTex, camData,
+                                                self->m_tlasBuilder.tlas_node_buf(),
+                                                self->m_tlasBuilder.instance_buf(),
+                                                self->m_tlasBuilder.blas_node_buf(),
+                                                self->m_tlasBuilder.blas_tri_buf(),
+                                                texViews);
+                } else if (self->m_bvhBuilder.is_ready()) {
+                    self->m_aoPass.execute(device, encoder, depthTex, camData,
+                                           self->m_bvhBuilder.node_buf(),
+                                           self->m_bvhBuilder.tri_buf(),
+                                           texViews);
+                }
             }
         }, this);
     }

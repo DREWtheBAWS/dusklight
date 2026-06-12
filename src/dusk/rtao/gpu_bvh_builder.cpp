@@ -144,10 +144,17 @@ fn cs_morton(@builtin(global_invocation_id) gid: vec3<u32>) {
     let scene_mn = vec3<f32>(b_scene[0u], b_scene[1u], b_scene[2u]);
     let scene_mx = vec3<f32>(b_scene[3u], b_scene[4u], b_scene[5u]);
     let extent   = max(scene_mx - scene_mn, vec3<f32>(1e-6));
-    let d = i * 6u;
-    let tmn = vec3<f32>(b_aabb[d], b_aabb[d+1u], b_aabb[d+2u]);
-    let tmx = vec3<f32>(b_aabb[d+3u], b_aabb[d+4u], b_aabb[d+5u]);
-    let c = clamp(((tmn + tmx) * 0.5 - scene_mn) / extent, vec3<f32>(0.0), vec3<f32>(1.0));
+    // Centroid read directly from b_tri_in (uploaded via CopyBufferToBuffer before any
+    // compute passes — never written by a shader, always fresh on D3D12).
+    // Previously this read b_aabb which was written by the immediately-preceding cs_bounds
+    // pass, hitting the same D3D12 UAV cache stale-read hazard as the other merged passes.
+    // GpuTriangle layout in b_tri_in: a[0-2], _pad[3], b[4-6], _pad[7], c[8-10], ...
+    let s  = i * 20u;
+    let ax = b_tri_in[s];     let ay = b_tri_in[s+1u]; let az = b_tri_in[s+2u];
+    let bx = b_tri_in[s+4u];  let by = b_tri_in[s+5u]; let bz = b_tri_in[s+6u];
+    let cx = b_tri_in[s+8u];  let cy = b_tri_in[s+9u]; let cz = b_tri_in[s+10u];
+    let centroid = vec3<f32>((ax+bx+cx)/3.0, (ay+by+cy)/3.0, (az+bz+cz)/3.0);
+    let c = clamp((centroid - scene_mn) / extent, vec3<f32>(0.0), vec3<f32>(1.0));
     let xi = u32(c.x * 1023.0);
     let yi = u32(c.y * 1023.0);
     let zi = u32(c.z * 1023.0);
@@ -190,17 +197,19 @@ fn cs_init_leaves(@builtin(global_invocation_id) gid: vec3<u32>) {
     let leaf = n - 1u + i;
     let tri  = b_idx[i];            // original triangle index (sorted permutation)
     let ao   = tri * 6u;
-    // Clamp leaf AABB to the mortonAabb (b_scene).  Large triangles that straddle
-    // the boundary of the AO-relevant region would otherwise inflate every ancestor
-    // node's AABB, causing AO rays to descend into subtrees they can never hit.
-    // The geometry collector already excludes triangles whose centroid is beyond the
-    // mortonAabb, so the clamped AABB is always non-degenerate (min ≤ max).
-    let scene_mn = vec3<f32>(b_scene[0u], b_scene[1u], b_scene[2u]);
-    let scene_mx = vec3<f32>(b_scene[3u], b_scene[4u], b_scene[5u]);
+    // Use the raw per-triangle AABB without clamping to mortonAabb.
+    // Clamping was removed because it causes false AABB misses: when a triangle's
+    // true AABB extends beyond the mortonAabb (common for terrain near the collection
+    // sphere boundary), ancestor node AABBs become smaller than reality.  AO rays
+    // targeting those regions then fail the slab test and skip the entire subtree
+    // even though the triangle is reachable — producing camera-dependent all-white
+    // output whenever the view rotation brings many triangles near the mortonAabb edge.
+    // The mortonAabb is still used by cs_morton for Morton code normalisation (quality);
+    // traversal correctness requires the full AABB.
     let raw_mn   = vec3<f32>(b_aabb[ao],    b_aabb[ao+1u], b_aabb[ao+2u]);
     let raw_mx   = vec3<f32>(b_aabb[ao+3u], b_aabb[ao+4u], b_aabb[ao+5u]);
-    b_nodes[leaf].bounds_min  = max(raw_mn, scene_mn);
-    b_nodes[leaf].bounds_max  = min(raw_mx, scene_mx);
+    b_nodes[leaf].bounds_min  = raw_mn;
+    b_nodes[leaf].bounds_max  = raw_mx;
     b_nodes[leaf].left_child  = 0xFFFFFFFFu;
     b_nodes[leaf].right_child = 0xFFFFFFFFu;
     b_nodes[leaf].tri_offset  = i;   // index into b_tri_out (sorted order)
@@ -217,9 +226,22 @@ fn cs_init_leaves(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // ==========================================================================
-// cs_lbvh: Karras 2012 parallel LBVH hierarchy construction.
+// cs_lbvh_aabb: Karras 2012 LBVH construction + AABB fit in one dispatch.
 // One thread per internal node (index 0..n-2).
 // Internal nodes occupy [0, n-2]; leaves occupy [n-1, 2n-2].
+//
+// Merging the former cs_lbvh and cs_aabb passes eliminates the cross-pass
+// UAV read hazard: cs_aabb previously read range_first/range_last from
+// b_nodes[idx] — data written by cs_lbvh in the immediately-preceding pass.
+// On D3D12, UAV cache flushes between consecutive compute passes are not
+// guaranteed on all drivers (this was the same issue that motivated the
+// leaf-range design over the earlier multi-pass child-union approach).
+// By computing [first, last] locally within the same thread and iterating
+// the leaves in the same invocation, no cross-pass range read is needed.
+//
+// The only remaining cross-pass read is leaf bounds_min/max from
+// cs_init_leaves (one pass before), which uses the same barrier that the
+// leaf-range approach already relied on.
 // ==========================================================================
 
 // Length of the longest common prefix of Morton codes at positions i and j.
@@ -234,7 +256,7 @@ fn delta(i_: i32, j_: i32, n_: i32) -> i32 {
 }
 
 @compute @workgroup_size(256)
-fn cs_lbvh(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn cs_lbvh_aabb(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = i32(gid.x);
     let n   = i32(b_params.tri_count);
     if (idx >= n - 1i) { return; }
@@ -296,40 +318,24 @@ fn cs_lbvh(@builtin(global_invocation_id) gid: vec3<u32>) {
     b_nodes[u32(idx)].tri_count   = 0u;
     b_nodes[u32(idx)].range_first = u32(first);
     b_nodes[u32(idx)].range_last  = u32(last);
-}
 
-// ==========================================================================
-// cs_aabb: compute AABB for each internal node by reducing its leaf range.
-// One thread per internal node (0..n-2).
-//
-// Reads ONLY from leaf nodes (n-1..2n-2), which are written exclusively by
-// cs_init_leaves in the previous pass.  Internal nodes are written but never
-// read within this dispatch, so there are no intra-dispatch races and no
-// cross-workgroup barriers are needed — a single dispatch is correct.
-//
-// (A multi-pass child-union approach was tried but caused frame-to-frame
-// instability on D3D12: UAV cache flushes between consecutive compute passes
-// are not guaranteed to be visible in the next pass's L1/L2 reads on all
-// drivers, leading to stale propagated values and a wrong root AABB.)
-// ==========================================================================
-@compute @workgroup_size(256)
-fn cs_aabb(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    let n   = b_params.tri_count;
-    if (idx >= n - 1u) { return; }
-
-    let first = b_nodes[idx].range_first;
-    let last  = b_nodes[idx].range_last;
-
+    // Compute AABB by reducing over sorted positions [first, last].
+    // Read b_idx (written by cs_bitonic, many passes before) and b_aabb (written by
+    // cs_bounds, the very first pass).  Both are far enough back in the dispatch chain
+    // that their cache lines are guaranteed flushed — no consecutive-pass UAV hazard.
+    // Deliberately NOT reading b_nodes[leaf].bounds_min/max here: those were written by
+    // cs_init_leaves in the immediately-preceding pass and are subject to the same D3D12
+    // UAV cache stale-read issue this merged pass was designed to eliminate.
     var mn = vec3<f32>( 1e30,  1e30,  1e30);
     var mx = vec3<f32>(-1e30, -1e30, -1e30);
-    for (var li = first; li <= last; li++) {
-        let leaf = n - 1u + li;
-        mn = min(mn, b_nodes[leaf].bounds_min);
-        mx = max(mx, b_nodes[leaf].bounds_max);
+    for (var li = u32(first); li <= u32(last); li++) {
+        let tri = b_idx[li];
+        let ao  = tri * 6u;
+        mn = min(mn, vec3<f32>(b_aabb[ao],    b_aabb[ao+1u], b_aabb[ao+2u]));
+        mx = max(mx, vec3<f32>(b_aabb[ao+3u], b_aabb[ao+4u], b_aabb[ao+5u]));
     }
-    b_nodes[idx].bounds_min = mn;
-    b_nodes[idx].bounds_max = mx;
+    b_nodes[u32(idx)].bounds_min = mn;
+    b_nodes[u32(idx)].bounds_max = mx;
 }
 )";
 
@@ -344,21 +350,6 @@ static uint32_t next_pow2(uint32_t n) {
     return ++n;
 }
 
-// Create a one-shot staging (upload) buffer that is already mapped and written.
-// Record a CopyBufferToBuffer into the encoder, then call wgpuBufferRelease —
-// Dawn keeps the underlying resource alive until the GPU finishes the copy.
-static WGPUBuffer make_upload_buf(WGPUDevice dev, const void* data, uint64_t size) {
-    const uint64_t aligned = (size + 3ull) & ~3ull;
-    WGPUBufferDescriptor d{};
-    d.size             = aligned;
-    d.usage            = WGPUBufferUsage_CopySrc;
-    d.mappedAtCreation = true;
-    WGPUBuffer buf = wgpuDeviceCreateBuffer(dev, &d);
-    void* ptr = wgpuBufferGetMappedRange(buf, 0, aligned);
-    memcpy(ptr, data, size);
-    wgpuBufferUnmap(buf);
-    return buf;
-}
 
 static WGPUBuffer make_buf(WGPUDevice dev, uint64_t size, WGPUBufferUsage usage,
                             const void* data = nullptr) {
@@ -394,8 +385,7 @@ GpuBvhBuilder::~GpuBvhBuilder() {
     if (m_pipeMorton)    wgpuComputePipelineRelease(m_pipeMorton);
     if (m_pipeBitonic)   wgpuComputePipelineRelease(m_pipeBitonic);
     if (m_pipeLeaves)    wgpuComputePipelineRelease(m_pipeLeaves);
-    if (m_pipeLbvh)      wgpuComputePipelineRelease(m_pipeLbvh);
-    if (m_pipeAabb)      wgpuComputePipelineRelease(m_pipeAabb);
+    if (m_pipeLbvhAabb)  wgpuComputePipelineRelease(m_pipeLbvhAabb);
     if (m_bgl)           wgpuBindGroupLayoutRelease(m_bgl);
     if (m_triInputBuf)   wgpuBufferRelease(m_triInputBuf);
     if (m_aabbBuf)       wgpuBufferRelease(m_aabbBuf);
@@ -464,13 +454,12 @@ void GpuBvhBuilder::ensure_pipelines(WGPUDevice device) {
     plDesc.bindGroupLayouts     = &m_bgl;
     WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(device, &plDesc);
 
-    m_pipeBounds  = make_pipeline(device, sm, pl, "cs_bounds");
-    m_pipeReduce  = make_pipeline(device, sm, pl, "cs_reduce");
-    m_pipeMorton  = make_pipeline(device, sm, pl, "cs_morton");
-    m_pipeBitonic = make_pipeline(device, sm, pl, "cs_bitonic");
-    m_pipeLeaves  = make_pipeline(device, sm, pl, "cs_init_leaves");
-    m_pipeLbvh    = make_pipeline(device, sm, pl, "cs_lbvh");
-    m_pipeAabb    = make_pipeline(device, sm, pl, "cs_aabb");
+    m_pipeBounds   = make_pipeline(device, sm, pl, "cs_bounds");
+    m_pipeReduce   = make_pipeline(device, sm, pl, "cs_reduce");
+    m_pipeMorton   = make_pipeline(device, sm, pl, "cs_morton");
+    m_pipeBitonic  = make_pipeline(device, sm, pl, "cs_bitonic");
+    m_pipeLeaves   = make_pipeline(device, sm, pl, "cs_init_leaves");
+    m_pipeLbvhAabb = make_pipeline(device, sm, pl, "cs_lbvh_aabb");
 
     wgpuPipelineLayoutRelease(pl);
     wgpuShaderModuleRelease(sm);
@@ -533,7 +522,7 @@ void GpuBvhBuilder::upload_triangles(WGPUDevice device,
 // build() — record uploads + all passes + copy into the caller's encoder
 // ---------------------------------------------------------------------------
 
-void GpuBvhBuilder::build(WGPUDevice device, WGPUCommandEncoder encoder) {
+void GpuBvhBuilder::build(WGPUDevice device) {
     if (m_triCount == 0 || !m_triInputBuf) return;
 
     ensure_pipelines(device);
@@ -588,26 +577,31 @@ void GpuBvhBuilder::build(WGPUDevice device, WGPUCommandEncoder encoder) {
         }
     }
 
-    // Upload triangle data, sort-step params, and Morton AABB as the first encoder
-    // commands.  The Morton AABB replaces cs_reduce: it's the ±m_mortonRange clamp
-    // computed above, isolating the relevant scene geometry from distant outliers.
+    // Upload all CPU-computed data via wgpuQueueWriteBuffer, BEFORE creating the
+    // command encoder.  This eliminates the intra-command-buffer CopyBufferToBuffer
+    // → cs_bounds stale-read hazard: D3D12 drivers do not reliably flush the L1/L2
+    // UAV cache between a COPY_DEST write and the immediately following compute read
+    // within the same command list.  For static geometry the stale value == the
+    // current value and the bug is invisible; when new geometry enters, b_tri_in
+    // changes and the stale read produces garbage AABBs → broken BVH → white AO.
+    // wgpuQueueWriteBuffer is a queue-level operation: Dawn guarantees all pending
+    // writes are flushed before executing any subsequently submitted command buffer,
+    // making the data unconditionally visible to every compute pass.
     {
+        WGPUQueue q = wgpuDeviceGetQueue(device);
         const uint64_t triBytes = uint64_t(m_triCount) * 80u;
-        WGPUBuffer stag = make_upload_buf(device, m_pendingTriData.data(), triBytes);
-        wgpuCommandEncoderCopyBufferToBuffer(encoder, stag, 0, m_triInputBuf, 0, triBytes);
-        wgpuBufferRelease(stag);
+        wgpuQueueWriteBuffer(q, m_triInputBuf,  0, m_pendingTriData.data(), triBytes);
+        wgpuQueueWriteBuffer(q, m_sceneAabbBuf, 0, mortonAabb,              sizeof(mortonAabb));
+        wgpuQueueWriteBuffer(q, m_sortStepsBuf, 0, stepsBlob.data(),        stepsBlob.size());
+        wgpuQueueRelease(q);
     }
-    {
-        WGPUBuffer stag = make_upload_buf(device, stepsBlob.data(), stepsBlob.size());
-        wgpuCommandEncoderCopyBufferToBuffer(encoder, stag, 0, m_sortStepsBuf, 0, stepsBlob.size());
-        wgpuBufferRelease(stag);
-    }
-    {
-        // Upload robust Morton AABB to b_scene — cs_reduce is skipped.
-        WGPUBuffer stag = make_upload_buf(device, mortonAabb, sizeof(mortonAabb));
-        wgpuCommandEncoderCopyBufferToBuffer(encoder, stag, 0, m_sceneAabbBuf, 0, sizeof(mortonAabb));
-        wgpuBufferRelease(stag);
-    }
+
+    // Dedicated command encoder for the compute passes only (no copies).
+    // Submitted immediately after recording; the AO pass runs in Aurora's encoder
+    // which is submitted after this function returns, so queue ordering guarantees
+    // BVH node writes are visible to the AO pass.
+    WGPUCommandEncoderDescriptor encDesc{};
+    WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(device, &encDesc);
 
     WGPUBindGroupEntry bge[8] = {};
     bge[0] = { .binding = 0, .buffer = m_triInputBuf,  .size = WGPU_WHOLE_SIZE };
@@ -627,13 +621,9 @@ void GpuBvhBuilder::build(WGPUDevice device, WGPUCommandEncoder encoder) {
 
     const auto t0 = std::chrono::steady_clock::now();
 
-    // Record all 7 BVH compute passes directly into the provided encoder.
-    // The caller (post-render callback) also records the AO pass into the same
-    // encoder, so the entire BVH-build + copy + AO sequence lives in one
-    // command buffer.  Dawn inserts the correct D3D12 resource-state barriers
-    // at every pass boundary within a single command buffer — UAV→UAV between
-    // compute passes, UAV→COPY_SRC before the copy, and COPY_DST→storage-read
-    // before the AO pass — without any cross-submission tracking uncertainty.
+    // Record all BVH compute passes.  No copies — data was already written via
+    // wgpuQueueWriteBuffer above.  Dawn inserts UAV→UAV barriers at each pass
+    // boundary within this command buffer.
     auto dispatch = [&](WGPUComputePipeline pipe, uint32_t groups_x, uint32_t off) {
         if (groups_x == 0) return;
         WGPUComputePassDescriptor pd{};
@@ -645,18 +635,30 @@ void GpuBvhBuilder::build(WGPUDevice device, WGPUCommandEncoder encoder) {
         wgpuComputePassEncoderRelease(cp);
     };
 
-    dispatch(m_pipeBounds,  g256_n, 0u);
+    dispatch(m_pipeBounds,   g256_n, 0u);
     // cs_reduce skipped — robust Morton AABB already uploaded from CPU above.
-    dispatch(m_pipeMorton,  (np + 255u) / 256u, 0u);
+    dispatch(m_pipeMorton,   (np + 255u) / 256u, 0u);
     for (uint32_t step = 0; step < sortStepCount; ++step)
-        dispatch(m_pipeBitonic, g256_p, (step + 1u) * kStride);
-    dispatch(m_pipeLeaves, g256_n, 0u);
-    dispatch(m_pipeLbvh,   g256_i, 0u);
-    dispatch(m_pipeAabb,   g256_i, 0u);
+        dispatch(m_pipeBitonic,  g256_p, (step + 1u) * kStride);
+    dispatch(m_pipeLeaves,   g256_n, 0u);
+    // cs_lbvh_aabb: merged topology + AABB pass — computes [first,last] locally
+    // so cs_aabb never reads range data written by the preceding pass (D3D12 fix).
+    dispatch(m_pipeLbvhAabb, g256_i, 0u);
 
     const auto t1 = std::chrono::steady_clock::now();
 
     wgpuBindGroupRelease(bg);
+
+    // Finish, submit, and release the dedicated BVH encoder.
+    // Dawn holds references to all referenced buffers until the command buffer
+    // completes, so releasing the staging buffers above was safe.
+    WGPUCommandBufferDescriptor cbDesc{};
+    WGPUCommandBuffer cb = wgpuCommandEncoderFinish(encoder, &cbDesc);
+    wgpuCommandEncoderRelease(encoder);
+    WGPUQueue q = wgpuDeviceGetQueue(device);
+    wgpuQueueSubmit(q, 1, &cb);
+    wgpuCommandBufferRelease(cb);
+    wgpuQueueRelease(q);
 
     m_lastStats = {n, 2u * n - 1u,
                    std::chrono::duration<float, std::milli>(t1 - t0).count(),

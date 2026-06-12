@@ -180,7 +180,7 @@ uint32_t Bvh::sah_split(uint32_t start, uint32_t end, const AABB& bounds) {
         for (uint32_t i = start; i < end; ++i) {
             const float c = get_axis(triangle_centroid(m_tris[i]), axis);
             int b = static_cast<int>(kBuckets * (c - axis_min) / (axis_max - axis_min));
-            b = std::min(b, kBuckets - 1);
+            b = std::max(0, std::min(b, kBuckets - 1));  // clamp both sides: FP rounding can push c slightly outside bounds
             ++buckets[b].count;
             buckets[b].bounds.expand(triangle_bounds(m_tris[i]));
         }
@@ -224,8 +224,8 @@ uint32_t Bvh::sah_split(uint32_t start, uint32_t end, const AABB& bounds) {
         m_tris.begin() + start, m_tris.begin() + end,
         [&](const Triangle& t) {
             const float c = get_axis(triangle_centroid(t), best_axis);
-            const int b = std::min(kBuckets - 1,
-                static_cast<int>(kBuckets * (c - axis_min) / (axis_max - axis_min)));
+            const int b = std::max(0, std::min(kBuckets - 1,
+                static_cast<int>(kBuckets * (c - axis_min) / (axis_max - axis_min))));
             return b < best_bucket;
         });
 

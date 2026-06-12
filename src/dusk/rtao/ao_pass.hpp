@@ -20,15 +20,23 @@ public:
 
     void set_params(const Params& p) { m_params = p; }
 
-    // Run the AO compute pass.  nodeBuf and triBuf come from GpuBvhBuilder each frame.
-    // texViews is the per-frame list of WGPUTextureView* for alpha-tested textures
-    // (from GeometryCollector::texture_views()).  Empty slots are filled with a
-    // 1×1 opaque-white fallback so all 16 shader slots are always bound.
+    // Run the AO compute pass using the GPU LBVH (single-level BVH, view space).
+    // nodeBuf and triBuf come from GpuBvhBuilder each frame.
     void execute(WGPUDevice device, WGPUCommandEncoder encoder,
                  WGPUTexture depthTex,
                  const GeometryCollector::CameraData& cam,
                  WGPUBuffer nodeBuf, WGPUBuffer triBuf,
                  const std::vector<void*>& texViews);
+
+    // Run the AO compute pass using the BLAS/TLAS two-level BVH.
+    // Buffers come from TlasBuilder.  Opaque-only (no alpha test) in this phase.
+    // Run the AO compute pass using the BLAS/TLAS two-level BVH (view-space).
+    void execute_tlas(WGPUDevice device, WGPUCommandEncoder encoder,
+                      WGPUTexture depthTex,
+                      const GeometryCollector::CameraData& cam,
+                      WGPUBuffer tlasNodeBuf, WGPUBuffer instanceBuf,
+                      WGPUBuffer blasNodeBuf, WGPUBuffer blasTriBuf,
+                      const std::vector<void*>& texViews);
 
     ImTextureID imgui_texture_id()   const;
     ImTextureID limits_texture_id()  const;
@@ -38,9 +46,11 @@ public:
 
 private:
     void ensure_pipeline(WGPUDevice device);
+    void ensure_tlas_pipeline(WGPUDevice device);
     void rebuild_output(WGPUDevice device, uint32_t w, uint32_t h);
     void rebuild_depth_binding(WGPUDevice device, WGPUTexture depthTex);
     void rebuild_bind_group(WGPUDevice device);
+    void rebuild_tlas_bind_group(WGPUDevice device);
 
     Params m_params{};
 
@@ -63,6 +73,16 @@ private:
 
     WGPUBindGroup m_bindGroup      = nullptr;
     bool          m_bindGroupDirty = true;
+
+    // TLAS/BLAS path (Phase 3) — separate pipeline + bind group
+    WGPUComputePipeline m_tlasPipeline           = nullptr;
+    WGPUBindGroupLayout m_tlasBgl                = nullptr;
+    WGPUBuffer          m_tlasLastNodeBuf        = nullptr;
+    WGPUBuffer          m_tlasLastInstBuf        = nullptr;
+    WGPUBuffer          m_tlasLastBlasNodeBuf    = nullptr;
+    WGPUBuffer          m_tlasLastBlasTriBuf     = nullptr;
+    WGPUBindGroup       m_tlasBindGroup          = nullptr;
+    bool                m_tlasBindGroupDirty     = true;
 
     // Alpha-texture sampler + 1×1 opaque-white fallback (pad empty slots).
     WGPUSampler     m_alphaSampler = nullptr;

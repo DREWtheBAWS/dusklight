@@ -78,6 +78,12 @@ void GeometryCollector::process_draw(const AuroraGxCaptureDraw* draw) {
         if (tx*tx + ty*ty + tz*tz < 1e-6f) return;
     }
 
+    // Fire the optional per-draw callback (used by BlasCache::record_draw).
+    if (m_drawCb) {
+        m_drawCb(*draw, m_drawCbUserdata);
+        ++m_drawCbFiredTotal;
+    }
+
     // Capture projection matrix from the first qualifying draw (needed by the AO pass).
     if (!m_pendingCameraData.valid) {
         memcpy(m_pendingCameraData.proj, draw->projMtx, sizeof(m_pendingCameraData.proj));

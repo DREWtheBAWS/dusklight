@@ -154,6 +154,42 @@ static Vec2 decode_uv(const AuroraGxCaptureDraw& d, uint32_t vi) {
   return {u, v};
 }
 
+std::vector<Triangle> decode_triangles_local(const AuroraGxCaptureDraw& draw) {
+  // Skip direct-attribute draws: no stable posArray pointer for BLAS identity.
+  if (draw.posAttrType == kGxDirect || !draw.posArray) return {};
+  // Note: hasPnMtxIdx draws are accepted — posOffset already accounts for the
+  // PNMTXIDX byte, so decode_pos() returns correct raw local positions.
+  // The BLAS cache verifies all vertices share a single matrix before calling.
+
+  std::vector<Triangle> out;
+  out.reserve(draw.indexCount / 3);
+  for (uint32_t i = 0; i + 2 < draw.indexCount; i += 3) {
+    const uint32_t ia = draw.indices[i];
+    const uint32_t ib = draw.indices[i + 1];
+    const uint32_t ic = draw.indices[i + 2];
+    // Raw positions only — no pnMtx transform.
+    out.push_back({ decode_pos(draw, ia), decode_pos(draw, ib), decode_pos(draw, ic) });
+  }
+
+#ifndef NDEBUG
+  // Layer 1: applying pnMtx to local positions must reproduce the view-space decode.
+  // Only valid (and only checked) for single-matrix draws with a known uniform slot.
+  if (!draw.hasPnMtxIdx && !out.empty()) {
+    auto viewTris = decode_triangles(draw);
+    if (!viewTris.empty()) {
+      const float (*m)[4] = draw.pnMtx[draw.currentPnMtx];
+      Vec3 got = transform(m, out[0].a);
+      constexpr float kEps = 0.5f;  // generous: large world coords accumulate float error
+      assert(std::abs(got.x - viewTris[0].a.x) <= kEps);
+      assert(std::abs(got.y - viewTris[0].a.y) <= kEps);
+      assert(std::abs(got.z - viewTris[0].a.z) <= kEps);
+    }
+  }
+#endif
+
+  return out;
+}
+
 void decode_uvs(const AuroraGxCaptureDraw& draw,
                 std::vector<Triangle>& tris,
                 uint32_t texSlot) {

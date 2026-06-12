@@ -466,6 +466,8 @@ set(DUSK_FILES src/dusk/main.cpp ${GAME_BASE_FILES} ${GAME_DEBUG_FILES}
     src/dusk/rtao/geometry_collector.cpp
     src/dusk/rtao/geometry_collector_aurora.cpp
     src/dusk/rtao/bvh.cpp
+    src/dusk/rtao/blas_cache.cpp
+    src/dusk/rtao/tlas_builder.cpp
     src/dusk/rtao/depth_viewer.cpp
     src/dusk/rtao/ao_pass.cpp
     src/dusk/rtao/gpu_bvh_builder.cpp

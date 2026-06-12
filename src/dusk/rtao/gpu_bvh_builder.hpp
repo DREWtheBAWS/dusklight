@@ -11,9 +11,10 @@ namespace dusk::rtao {
 // buffer are consumed directly by AoPass — no CPU readback required.
 //
 // Call order each frame (inside the post-render callback):
-//   1. upload_triangles(device, queue, tris)   — CPU→GPU copy
-//   2. build(device, encoder)                  — 6 compute passes
-//   3. ao_pass.execute(..., node_buf(), tri_buf())
+//   1. upload_triangles(device, tris)  — packs CPU data into pending upload buffer
+//   2. build(device)                   — creates own encoder, submits, flushes BVH
+//   3. ao_pass.execute(...)            — recorded into Aurora's encoder; BVH data
+//                                        guaranteed visible because build() submitted first
 class GpuBvhBuilder {
 public:
     struct Stats {
@@ -34,11 +35,14 @@ public:
     // encoder so Dawn handles COPY_DST→storage barriers within one command buffer.
     void upload_triangles(WGPUDevice device, const std::vector<Triangle>& tris);
 
-    // Record all BVH build passes + uploads + result copy into the provided
-    // encoder.  Everything lives in one command buffer; Dawn inserts the correct
-    // D3D12 resource-state barriers (COPY_DST→CBV, COPY_DST→UAV, UAV→COPY_SRC,
-    // etc.) at every pass boundary — no cross-submission tracking uncertainty.
-    void build(WGPUDevice device, WGPUCommandEncoder encoder);
+    // Build the BVH: creates its own WGPUCommandEncoder, records all passes and
+    // uploads, finishes and submits to the device queue, then releases the encoder.
+    // By submitting in a dedicated command buffer BEFORE the caller's encoder is
+    // submitted, the GPU queue ordering guarantees all BVH writes are visible to
+    // the AO pass (recorded in the caller's encoder) without relying on intra-
+    // command-buffer UAV barriers — which proved unreliable on D3D12 drivers for
+    // consecutive storage-buffer write → read pairs within the same submission.
+    void build(WGPUDevice device);
 
     // Set the half-extent used for Morton AABB clamping.
     // Geometry beyond this distance from the camera gets Morton codes at the
@@ -52,10 +56,10 @@ public:
         m_worldPos[0] = x; m_worldPos[1] = y; m_worldPos[2] = z;
     }
 
-    // Output buffers consumed by AoPass.  Returned directly (no copy) so that
-    // UAV→SRV transitions happen within the same encoder as the BVH passes.
-    // D3D12 UAV state decays to COMMON between command lists, allowing implicit
-    // promotion to SRV for frames where the BVH is not rebuilt.
+    // Output buffers consumed by AoPass.  Always valid after the first build()
+    // call.  Because build() submits its own command buffer before returning,
+    // D3D12 implicit state promotion guarantees the buffers are in COMMON state
+    // (readable as SRV/UAV) by the time the caller's encoder runs.
     WGPUBuffer node_buf()  const { return m_nodeBuf; }
     WGPUBuffer tri_buf()   const { return m_triBuf;  }
     uint32_t   tri_count() const { return m_triCount; }
@@ -95,8 +99,7 @@ private:
     WGPUComputePipeline m_pipeMorton    = nullptr;
     WGPUComputePipeline m_pipeBitonic   = nullptr;
     WGPUComputePipeline m_pipeLeaves    = nullptr;  // initialise leaf nodes
-    WGPUComputePipeline m_pipeLbvh      = nullptr;  // Karras hierarchy
-    WGPUComputePipeline m_pipeAabb      = nullptr;  // bottom-up AABB fit
+    WGPUComputePipeline m_pipeLbvhAabb  = nullptr;  // Karras hierarchy + AABB fit (merged)
 
     WGPUBindGroupLayout m_bgl = nullptr;
 
