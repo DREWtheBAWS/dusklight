@@ -72,13 +72,13 @@ namespace dusk {
         bool  m_buildBvhOnly    = false;  // debug: skip AO pass after BVH build
         bool  m_bvhFrozen       = false;  // debug: stop rebuilding BVH each frame
         bool  m_bvhCaptureOnce  = false;  // debug: do one rebuild then auto-freeze
-        bool  m_useTlasBvh      = false;  // false=LBVH path, true=BLAS/TLAS path
+        bool  m_useTlasBvh      = true;   // false=LBVH path, true=BLAS/TLAS path
         bool     m_aoEnabled          = true;   // apply composite pass to the EFB
         float    m_aoStrength         = 1.0f;   // [0,1] blend factor for AO composite
         bool     m_denoiseEnabled     = true;
         int      m_denoiseIterations  = 4;
-        float    m_denoiseSigmaZ      = 0.1f;
-        float    m_denoiseSigmaL      = 0.15f;
+        float    m_denoiseSigmaZ      = 1.0f;
+        float    m_denoiseSigmaL      = 1.0f;
         dusk::rtao::BlasCache          m_blasCache;   // declared before m_collector (callback sets up pointer)
         dusk::rtao::TlasBuilder        m_tlasBuilder;
         dusk::rtao::GeometryCollector  m_collector;

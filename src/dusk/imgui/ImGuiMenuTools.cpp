@@ -18,6 +18,7 @@
 #include "dusk/main.h"
 #include "m_Do/m_Do_main.h"
 
+#include <algorithm>
 #include <aurora/lib/internal.hpp>
 #include <SDL3/SDL_misc.h>
 
@@ -37,6 +38,30 @@ namespace dusk {
         }, &m_blasCache);
         aurora_set_post_render_callback([](WGPUDevice device, WGPUCommandEncoder encoder, void* userdata) {
             auto* self = static_cast<ImGuiMenuTools*>(userdata);
+
+            // When the debug capture window is not open, drive everything from persistent settings.
+            // The capture window overrides these each frame when it is visible.
+            if (!self->m_showRtaoCapture) {
+                if (!getSettings().game.rtaoEnabled.getValue()) {
+                    return; // Skip all RT work — zero GPU overhead
+                }
+                const float dist = static_cast<float>(getSettings().game.rtaoRayLength.getValue());
+                static constexpr uint32_t kQualityRays[] = {1u, 4u, 8u};
+                const int q = std::clamp(getSettings().game.rtaoQuality.getValue(), 0, 2);
+                self->m_aoPass.set_params({kQualityRays[q], dist, 0.01f, 0u, 0u});
+                self->m_aoStrength = getSettings().game.rtaoIntensity.getValue();
+                const int iters = getSettings().game.rtaoDenoiserIterations.getValue();
+                self->m_denoiseIterations = iters;
+                self->m_denoiseEnabled = (iters > 0);
+                self->m_useTlasBvh   = true;
+                self->m_aoEnabled    = true;
+                self->m_buildBvhOnly = false;
+                self->m_bvhFrozen    = false;
+                self->m_collector.set_max_distance(dist * 4.f);
+                self->m_collector.set_frustum_margin(dist);
+                self->m_collector.set_max_edge_length(dist * 3.f);
+                self->m_bvhBuilder.set_morton_range(dist * 4.f);
+            }
 
             // Build new BLASes (SAH, local space) and upload to GPU.
             // Runs unconditionally so the cache stays warm even when the LBVH is frozen.

@@ -169,6 +169,13 @@ struct UserSettings {
         ConfigVar<bool> enableMapBackground;
         ConfigVar<bool> disableCutscenePillarboxing;
 
+        // Raytracing
+        ConfigVar<bool>  rtaoEnabled;
+        ConfigVar<int>   rtaoQuality;           // 0=Low(1ray), 1=Medium(4rays), 2=High(8rays)
+        ConfigVar<int>   rtaoRayLength;
+        ConfigVar<float> rtaoIntensity;
+        ConfigVar<int>   rtaoDenoiserIterations;
+
         // Audio
         ConfigVar<bool> noLowHpSound;
         ConfigVar<bool> midnasLamentNonStop;

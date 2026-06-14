@@ -69,6 +69,13 @@ UserSettings g_userSettings = {
         .enableMapBackground {"game.enableMapBackground", true},
         .disableCutscenePillarboxing {"game.disableCutscenePillarboxing", false},
 
+        // Raytracing
+        .rtaoEnabled {"game.rtaoEnabled", true},
+        .rtaoQuality {"game.rtaoQuality", 2},
+        .rtaoRayLength {"game.rtaoRayLength", 100},
+        .rtaoIntensity {"game.rtaoIntensity", 1.0f},
+        .rtaoDenoiserIterations {"game.rtaoDenoiserIterations", 5},
+
         // Audio
         .noLowHpSound {"game.noLowHpSound", false},
         .midnasLamentNonStop {"game.midnasLamentNonStop", false},
@@ -231,6 +238,11 @@ void registerSettings() {
     Register(g_userSettings.game.enableDepthOfField);
     Register(g_userSettings.game.enableMapBackground);
     Register(g_userSettings.game.disableCutscenePillarboxing);
+    Register(g_userSettings.game.rtaoEnabled);
+    Register(g_userSettings.game.rtaoQuality);
+    Register(g_userSettings.game.rtaoRayLength);
+    Register(g_userSettings.game.rtaoIntensity);
+    Register(g_userSettings.game.rtaoDenoiserIterations);
     Register(g_userSettings.game.enableFastIronBoots);
     Register(g_userSettings.game.canTransformAnywhere);
     Register(g_userSettings.game.fastRoll);

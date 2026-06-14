@@ -76,6 +76,9 @@ constexpr std::array kMenuScalingModeLabels = {
     "Dusklight",
 };
 
+constexpr std::array kRtaoQualityNames = {"Low", "Medium", "High"};
+constexpr std::array kRtaoQualityRayCount = {1, 4, 8};
+
 bool try_parse_backend(std::string_view backend, AuroraBackend& outBackend) {
     if (backend == "auto") {
         outBackend = BACKEND_AUTO;
@@ -896,6 +899,69 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
             {
                 .key = "Disable Cutscene Pillarboxing",
             });
+
+        leftPane.add_section("Raytracing");
+        config_bool_select(leftPane, rightPane, getSettings().game.rtaoEnabled, {
+            .key = "Enable Ray Tracing",
+            .helpText =
+                "Enable raytraced ambient occlusion (RTAO). Adds contact shadows and depth cues "
+                "by casting rays from every pixel.<br/><br/>When disabled, the entire RT pass is "
+                "skipped with no GPU performance cost.",
+        });
+        leftPane.register_control(
+            leftPane.add_select_button({
+                .key = "Quality",
+                .getValue =
+                    [] {
+                        const int q = std::clamp(getSettings().game.rtaoQuality.getValue(), 0, 2);
+                        return Rml::String{kRtaoQualityNames[q]};
+                    },
+                .isDisabled = [] { return !getSettings().game.rtaoEnabled.getValue(); },
+                .isModified =
+                    [] {
+                        return getSettings().game.rtaoQuality.getValue() !=
+                               getSettings().game.rtaoQuality.getDefaultValue();
+                    },
+            }),
+            rightPane, [](Pane& pane) {
+                for (int i = 0; i < static_cast<int>(kRtaoQualityNames.size()); ++i) {
+                    pane.add_button({
+                            .text = Rml::String{kRtaoQualityNames[i]},
+                            .isSelected =
+                                [i] { return getSettings().game.rtaoQuality.getValue() == i; },
+                        })
+                        .on_pressed([i] {
+                            mDoAud_seStartMenu(kSoundItemChange);
+                            getSettings().game.rtaoQuality.setValue(i);
+                            config::Save();
+                        });
+                }
+                pane.add_rml(
+                    fmt::format("<br/><b>Low</b>: {} ray/pixel — fastest, noisier.<br/>"
+                                "<b>Medium</b>: {} rays/pixel — balanced.<br/>"
+                                "<b>High</b>: {} rays/pixel — smoothest, highest GPU cost.",
+                                kRtaoQualityRayCount[0], kRtaoQualityRayCount[1],
+                                kRtaoQualityRayCount[2])
+                        .c_str());
+            });
+        config_int_select(leftPane, rightPane, getSettings().game.rtaoRayLength,
+            "AO Ray Length",
+            "Maximum distance for ambient occlusion rays. Shorter rays produce tight contact "
+            "shadows near surfaces; longer rays capture broader self-shadowing.",
+            10, 500, 10,
+            [] { return !getSettings().game.rtaoEnabled.getValue(); });
+        config_percent_select(leftPane, rightPane, getSettings().game.rtaoIntensity,
+            "AO Intensity",
+            "Blend strength of the ambient occlusion effect. 100% fully applies AO; lower values "
+            "mix it more subtly.",
+            0, 100, 5,
+            [] { return !getSettings().game.rtaoEnabled.getValue(); });
+        config_int_select(leftPane, rightPane, getSettings().game.rtaoDenoiserIterations,
+            "Denoiser Quality",
+            "Number of A-trous filter passes applied to the AO output. Higher values produce "
+            "smoother results at a small GPU cost. Set to 0 to disable denoising.",
+            0, 5, 1,
+            [] { return !getSettings().game.rtaoEnabled.getValue(); });
     });
 
     add_tab("Input", [this](Rml::Element* content) {
