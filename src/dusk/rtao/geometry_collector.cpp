@@ -84,9 +84,18 @@ void GeometryCollector::process_draw(const AuroraGxCaptureDraw* draw) {
         ++m_drawCbFiredTotal;
     }
 
-    // Capture projection matrix from the first qualifying draw (needed by the AO pass).
+    // Capture projection and view matrices from the first qualifying draw.
+    // GX slot 0 is loaded with the pure view matrix (world→view) before any object draws.
     if (!m_pendingCameraData.valid) {
         memcpy(m_pendingCameraData.proj, draw->projMtx, sizeof(m_pendingCameraData.proj));
+        const float (&vm)[3][4] = draw->pnMtx[0];
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 4; ++c)
+                m_pendingCameraData.view[r][c] = vm[r][c];
+        m_pendingCameraData.view[3][0] = 0.f;
+        m_pendingCameraData.view[3][1] = 0.f;
+        m_pendingCameraData.view[3][2] = 0.f;
+        m_pendingCameraData.view[3][3] = 1.f;
         m_pendingCameraData.valid = true;
     }
 

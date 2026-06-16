@@ -40,7 +40,6 @@ uint32_t BlasCache::record_draw(const AuroraGxCaptureDraw& draw) {
     if (m_instancesClearPending) {
         m_instances.clear();
         m_dynamicTrisBuf.clear();
-        m_hasDynamic = false;
         m_instancesClearPending = false;
     }
 
@@ -150,25 +149,12 @@ uint32_t BlasCache::flush() {
         totalBytes += uint64_t(e.nodeCount) * sizeof(GpuNode)
                     + uint64_t(e.triCount)  * sizeof(GpuTri);
 
-    // Build the per-frame dynamic BLAS from all accumulated skinned-mesh triangles.
-    if (!m_dynamicTrisBuf.empty()) {
-        m_dynamicEntry = DynamicEntry{};
-        m_dynamicEntry.bvh.build(m_dynamicTrisBuf);
-        if (!m_dynamicEntry.bvh.empty()) {
-            m_dynamicEntry.viewAabb  = m_dynamicEntry.bvh.nodes()[0].bounds;
-            m_dynamicEntry.nodeCount = m_dynamicEntry.bvh.node_count();
-            m_dynamicEntry.triCount  = static_cast<uint32_t>(m_dynamicEntry.bvh.tris().size());
-            m_hasDynamic = true;
-        }
-    }
-
     m_lastStats.totalCached   = static_cast<uint32_t>(m_entries.size());
     m_lastStats.pendingCount  = static_cast<uint32_t>(m_pending.size());
     m_lastStats.seenThisFrame = m_seenThisFrame;
     m_lastStats.newThisFrame  = built;
     m_lastStats.gpuBytesTotal = totalBytes;
     m_lastStats.dynTriCount   = static_cast<uint32_t>(m_dynamicTrisBuf.size());
-    m_lastStats.dynNodeCount  = m_hasDynamic ? m_dynamicEntry.nodeCount : 0u;
     m_lastStats.flushMs = std::chrono::duration<float, std::milli>(
         std::chrono::high_resolution_clock::now() - t0).count();
     // Note: rejectedDirect/rejectedSkinned/totalCallsThisFrame are committed in

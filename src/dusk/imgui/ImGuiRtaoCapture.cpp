@@ -135,12 +135,18 @@ void ImGuiMenuTools::ShowRtaoCaptureWindow() {
     }
     ImGui::Text("record_draw() total ever: %u", m_blasCache.total_record_draw_calls_ever());
     ImGui::Text("flush: %.2f ms", blasStats.flushMs);
-    ImGui::Text("Dynamic (skinned): %u tris -> %u nodes",
-                blasStats.dynTriCount, blasStats.dynNodeCount);
+    const auto dynLbvhStats = m_bvhBuilder.last_stats();
+    ImGui::Text("Dynamic (skinned): %u tris -> GPU LBVH: %u nodes (%.2f ms)",
+                blasStats.dynTriCount, dynLbvhStats.nodeCount, dynLbvhStats.buildMs);
 
     // ---- Layer 2b: TLAS stats -------------------------------------------
     ImGui::Separator();
     ImGui::TextDisabled("TLAS");
+    {
+        static bool s_excludeSkinned = false;
+        if (ImGui::Checkbox("Exclude skinned (validate static cache)", &s_excludeSkinned))
+            m_excludeSkinned = s_excludeSkinned;
+    }
     const auto tlasStats = m_tlasBuilder.last_stats();
     if (m_tlasBuilder.is_ready()) {
         ImGui::Text("Nodes: %u  |  Instances: %u  |  Dedup removed: %u  |  BLASes: %u",
@@ -148,12 +154,15 @@ void ImGuiMenuTools::ShowRtaoCaptureWindow() {
                     tlasStats.dedupRejected, tlasStats.blasEntryCount);
         ImGui::Text("Mono BLAS: %u nodes, %u tris",
                     tlasStats.blasNodeTotal, tlasStats.blasTriTotal);
-        ImGui::Text("build: %.2f ms  |  flush: %.2f ms",
-                    tlasStats.buildMs, tlasStats.flushMs);
+        const char* cacheTag = (tlasStats.cached && tlasStats.instCached) ? "  [CACHED]"
+                             : tlasStats.cached                           ? "  [NODES CACHED]"
+                             :                                              "";
+        ImGui::Text("build: %.2f ms  |  flush: %.2f ms%s",
+                    tlasStats.buildMs, tlasStats.flushMs, cacheTag);
         const float rootEx = tlasStats.rootAabbMax[0] - tlasStats.rootAabbMin[0];
         const float rootEy = tlasStats.rootAabbMax[1] - tlasStats.rootAabbMin[1];
         const float rootEz = tlasStats.rootAabbMax[2] - tlasStats.rootAabbMin[2];
-        ImGui::Text("Root AABB: %.0f x %.0f x %.0f (view space)", rootEx, rootEy, rootEz);
+        ImGui::Text("Root AABB: %.0f x %.0f x %.0f (world space)", rootEx, rootEy, rootEz);
         const float mb = float(tlasStats.gpuBytesTotal) / (1024.f * 1024.f);
         ImGui::Text("GPU total: %.2f MB", mb);
     } else {
@@ -434,11 +443,11 @@ void ImGuiMenuTools::ShowRtaoCaptureWindow() {
                             static_cast<uint32_t>(m_blasCache.instances().size()));
             }
 
-            // --- Yellow: AO geometry (TLAS instances, view-space AABBs) ---
+            // --- Yellow: AO geometry (TLAS instances, world-space AABBs) ---
             // These are EXACTLY what the AO shader traverses this frame.
             if (s_showTlasAabbOverlay) {
                 std::vector<rtao::AABB> tlasAabbs;
-                m_tlasBuilder.get_instance_view_aabbs(tlasAabbs);
+                m_tlasBuilder.get_instance_world_aabbs(tlasAabbs);
                 uint32_t drawn = 0;
                 for (const auto& aabb : tlasAabbs) {
                     if (drawn >= 500) break;

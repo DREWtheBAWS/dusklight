@@ -67,42 +67,57 @@ namespace dusk {
             // Runs unconditionally so the cache stays warm even when the LBVH is frozen.
             self->m_blasCache.flush();
 
-            // Build the view-space TLAS over this frame's instances.
+            // Camera data is needed for the world-space TLAS build and the AO passes.
+            const auto& camData  = self->m_collector.pending_camera_data();
+
+            // Build the world-space TLAS over this frame's instances.
             // Must run after m_blasCache.flush() so all BLAS entries are available.
-            self->m_tlasBuilder.build(self->m_blasCache);
+            self->m_tlasBuilder.build(self->m_blasCache, camData.view);
             self->m_tlasBuilder.flush(device);
 
-            const bool doRebuild = !self->m_bvhFrozen || self->m_bvhCaptureOnce;
-            if (doRebuild) {
-                // Rebuild the LBVH from this frame's captured geometry (view space).
-                const auto& tris = self->m_collector.raw_triangles();
-                if (!tris.empty()) {
-                    self->m_bvhBuilder.upload_triangles(device, tris);
-                    // build() creates its own encoder, submits it to the queue, and
-                    // returns.  The AO pass below runs in Aurora's encoder, which is
-                    // submitted after this callback returns — guaranteeing the BVH
-                    // writes are visible without relying on intra-command-buffer barriers.
-                    self->m_bvhBuilder.build(device);
-
-                    // "Capture once" → freeze after this one rebuild
-                    if (self->m_bvhCaptureOnce) {
-                        self->m_bvhFrozen      = true;
-                        self->m_bvhCaptureOnce = false;
+            if (self->m_useTlasBvh) {
+                // Phase 3: build GPU LBVH each frame from skinned-mesh triangles only.
+                // build() submits its own command buffer before returning, so LBVH writes
+                // are visible to the AO pass in Aurora's encoder submitted afterward.
+                if (!self->m_excludeSkinned) {
+                    const auto& dynTris = self->m_blasCache.dynamic_triangles();
+                    if (!dynTris.empty()) {
+                        self->m_bvhBuilder.upload_triangles(device, dynTris);
+                        self->m_bvhBuilder.build(device);
+                    }
+                }
+            } else {
+                // Original LBVH path: all captured geometry (single-level BVH).
+                const bool doRebuild = !self->m_bvhFrozen || self->m_bvhCaptureOnce;
+                if (doRebuild) {
+                    const auto& tris = self->m_collector.raw_triangles();
+                    if (!tris.empty()) {
+                        self->m_bvhBuilder.upload_triangles(device, tris);
+                        self->m_bvhBuilder.build(device);
+                        if (self->m_bvhCaptureOnce) {
+                            self->m_bvhFrozen      = true;
+                            self->m_bvhCaptureOnce = false;
+                        }
                     }
                 }
             }
 
             // AO pass: choose LBVH or BLAS/TLAS based on user toggle.
             WGPUTexture depthTex = aurora_get_depth_texture();
-            const auto& camData  = self->m_collector.pending_camera_data();
             const auto& texViews = self->m_collector.texture_views();
             if (!self->m_buildBvhOnly) {
                 if (self->m_useTlasBvh && self->m_tlasBuilder.is_ready()) {
+                    const bool hasDyn = !self->m_excludeSkinned
+                                     && self->m_bvhBuilder.is_ready()
+                                     && !self->m_blasCache.dynamic_triangles().empty();
                     self->m_aoPass.execute_tlas(device, encoder, depthTex, camData,
                                                 self->m_tlasBuilder.tlas_node_buf(),
                                                 self->m_tlasBuilder.instance_buf(),
                                                 self->m_tlasBuilder.blas_node_buf(),
                                                 self->m_tlasBuilder.blas_tri_buf(),
+                                                hasDyn ? self->m_bvhBuilder.node_buf() : nullptr,
+                                                hasDyn ? self->m_bvhBuilder.tri_buf()  : nullptr,
+                                                hasDyn ? self->m_bvhBuilder.last_stats().nodeCount : 0u,
                                                 texViews);
                 } else if (self->m_bvhBuilder.is_ready()) {
                     self->m_aoPass.execute(device, encoder, depthTex, camData,

@@ -68,16 +68,6 @@ public:
         float   pnMtx[3][4];  // local-to-view matrix for this particular draw instance
     };
 
-    // Per-frame dynamic (skinned) BLAS — all multi-matrix draw triangles merged into
-    // one view-space BVH, rebuilt every frame.  Exposed to TlasBuilder for packing
-    // at the end of the combined monolithic buffer.
-    struct DynamicEntry {
-        Bvh      bvh;
-        AABB     viewAabb;
-        uint32_t nodeCount = 0;
-        uint32_t triCount  = 0;
-    };
-
     struct Stats {
         uint32_t totalCached;       // live entries in cache
         uint32_t pendingCount;      // queued for build but not yet processed
@@ -91,8 +81,7 @@ public:
         uint32_t totalCallsThisFrame; // total record_draw() calls
         uint32_t instanceCount;       // instances accumulated in last aurora_end_frame
         float    flushMs;             // CPU time for flush() this frame (ms)
-        uint32_t dynTriCount;         // skinned tris accumulated for dynamic BLAS this frame
-        uint32_t dynNodeCount;        // nodes in the dynamic BLAS (0 if not built yet)
+        uint32_t dynTriCount;         // skinned tris accumulated for the GPU dynamic LBVH this frame
     };
 
     ~BlasCache();
@@ -120,8 +109,8 @@ public:
     uint32_t                                           eviction_generation() const { return m_evictionGeneration; }
     const std::vector<Instance>&                       instances()      const { return m_instances; }
     const std::unordered_map<BlasKey, Entry, BlasKeyHash>& entries()     const { return m_entries; }
-    bool                 has_dynamic_entry() const { return m_hasDynamic; }
-    const DynamicEntry&  dynamic_entry()     const { return m_dynamicEntry; }
+    // Raw view-space skinned triangles for this frame (fed to GPU LBVH builder).
+    const std::vector<Triangle>& dynamic_triangles() const { return m_dynamicTrisBuf; }
 
     // Per-frame build budget: limits per-frame CPU cost while new areas are explored.
     // After kMaxEntries BLASes are cached the queue drains and subsequent frames are free.
@@ -151,10 +140,8 @@ private:
     bool                                     m_instancesClearPending = false;
     Stats                                    m_lastStats{};
 
-    // Dynamic (skinned) BLAS — rebuilt every frame from multi-matrix draw calls.
-    std::vector<Triangle> m_dynamicTrisBuf; // accumulates view-space tris across record_draw()
-    DynamicEntry          m_dynamicEntry;   // built in flush(), valid until advance_frame()
-    bool                  m_hasDynamic = false;
+    // Dynamic (skinned) triangles — view-space, accumulated per frame, fed to GPU LBVH.
+    std::vector<Triangle> m_dynamicTrisBuf;
 };
 
 } // namespace dusk::rtao

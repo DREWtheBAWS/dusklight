@@ -1,4 +1,5 @@
 #include "vertex_decoder.hpp"
+#include <cassert>
 #include <cstring>
 
 // GXCompType constants (matches GXEnum.h)

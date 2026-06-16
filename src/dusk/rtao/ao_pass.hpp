@@ -28,14 +28,16 @@ public:
                  WGPUBuffer nodeBuf, WGPUBuffer triBuf,
                  const std::vector<void*>& texViews);
 
-    // Run the AO compute pass using the BLAS/TLAS two-level BVH.
-    // Buffers come from TlasBuilder.  Opaque-only (no alpha test) in this phase.
-    // Run the AO compute pass using the BLAS/TLAS two-level BVH (view-space).
+    // Run the AO compute pass using the BLAS/TLAS two-level BVH (static geometry) plus
+    // an optional GPU LBVH for dynamic (skinned) geometry in view space.
+    // dynNodeBuf/dynTriBuf may be null when there is no skinned geometry this frame;
+    // dynNodeCount must be 0 in that case.
     void execute_tlas(WGPUDevice device, WGPUCommandEncoder encoder,
                       WGPUTexture depthTex,
                       const GeometryCollector::CameraData& cam,
                       WGPUBuffer tlasNodeBuf, WGPUBuffer instanceBuf,
                       WGPUBuffer blasNodeBuf, WGPUBuffer blasTriBuf,
+                      WGPUBuffer dynNodeBuf, WGPUBuffer dynTriBuf, uint32_t dynNodeCount,
                       const std::vector<void*>& texViews);
 
     ImTextureID     imgui_texture_id()   const;
@@ -75,13 +77,17 @@ private:
     WGPUBindGroup m_bindGroup      = nullptr;
     bool          m_bindGroupDirty = true;
 
-    // TLAS/BLAS path (Phase 3) — separate pipeline + bind group
+    // TLAS/BLAS path — separate pipeline + bind group
     WGPUComputePipeline m_tlasPipeline           = nullptr;
     WGPUBindGroupLayout m_tlasBgl                = nullptr;
     WGPUBuffer          m_tlasLastNodeBuf        = nullptr;
     WGPUBuffer          m_tlasLastInstBuf        = nullptr;
     WGPUBuffer          m_tlasLastBlasNodeBuf    = nullptr;
     WGPUBuffer          m_tlasLastBlasTriBuf     = nullptr;
+    WGPUBuffer          m_tlasLastDynNodeBuf     = nullptr;  // nullable; dynamic LBVH nodes
+    WGPUBuffer          m_tlasLastDynTriBuf      = nullptr;  // nullable; dynamic LBVH tris
+    WGPUBuffer          m_dynDummyNodeBuf        = nullptr;  // 4-byte fallback when no dynamic geo
+    WGPUBuffer          m_dynDummyTriBuf         = nullptr;
     WGPUBindGroup       m_tlasBindGroup          = nullptr;
     bool                m_tlasBindGroupDirty     = true;
 

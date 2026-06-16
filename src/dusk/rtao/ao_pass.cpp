@@ -35,7 +35,7 @@ struct GpuTriangle {
 };
 static_assert(sizeof(GpuTriangle) == 80);
 
-// 112 bytes — matches WGSL Camera uniform
+// 176 bytes — matches WGSL Camera uniform (both LBVH and TLAS shaders)
 struct GpuCamera {
     float    invViewProj[16]; // col-major mat4x4 = inv(P), offset 0; unprojects NDC → view space
     uint32_t screenWidth;     // offset 64
@@ -46,12 +46,15 @@ struct GpuCamera {
     float    normalBias;      // offset 84
     uint32_t debugMode;       // offset 88  0=AO,1=normals,2=depth,3=root-AABB
     uint32_t debugMode2;      // offset 92  0=limit-hits,1=AO,2=normals,3=depth,4=root-AABB
-    float    camWorldX;       // offset 96  (unused in view-space BVH, kept for struct alignment)
+    float    camWorldX;       // offset 96  camera world position (used by LBVH path)
     float    camWorldY;       // offset 100
     float    camWorldZ;       // offset 104
     uint32_t _pad2;           // offset 108
+    float    viewToWorld[12]; // offset 112 view→world 3×4 affine matrix, row-major
+    uint32_t dynNodeCount;    // offset 160 GPU LBVH node count for dynamic (skinned) geometry; 0=none
+    uint32_t _pad3[3];        // offset 164 padding to 176
 };
-static_assert(sizeof(GpuCamera) == 112);
+static_assert(sizeof(GpuCamera) == 176);
 
 // ---------------------------------------------------------------------------
 // CPU-side 4×4 matrix math
@@ -112,6 +115,26 @@ static bool compute_inv_proj(const GeometryCollector::CameraData& cam,
     // Storing invP_rm row-major into out_col_major puts inv(P)^T in WGSL
     // column-major: `v * M_wgsl = (inv(P) × v)^T`. ✓
     std::memcpy(out_col_major, invP_rm, 16 * sizeof(float));
+    return true;
+}
+
+// Compute the view→world 3×4 affine matrix (inverse of the view matrix) and
+// pack it row-major into out[12].  Returns false if the view matrix is singular.
+static bool compute_view_to_world(const GeometryCollector::CameraData& cam,
+                                   float out[12]) {
+    float V[16] = {};
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+            V[r*4+c] = cam.view[r][c];
+    if (V[15] == 0.f) V[15] = 1.f;  // ensure homogeneous row is [0,0,0,1]
+
+    float invV[16];
+    if (!mat4_invert_flat(V, invV)) return false;
+
+    // Pack the 3×4 portion row-major: out[r*4+c] = invV[r][c], r=0..2, c=0..3.
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 4; ++c)
+            out[r*4+c] = invV[r*4+c];
     return true;
 }
 
@@ -542,21 +565,28 @@ struct BlasTri {
     v2 : vec4<f32>,
 }
 
-// Camera UBO: identical to the LBVH shader's Camera struct.
+// Camera UBO: 176 bytes, matches GpuCamera on the CPU.
 struct Camera {
-    inv_view_proj : mat4x4<f32>,
-    screen_width  : u32,
-    screen_height : u32,
-    rays_per_pixel: u32,
-    frame_seed    : u32,
-    max_distance  : f32,
-    normal_bias   : f32,
-    debug_mode    : u32,
-    debug_mode2   : u32,
-    cam_world_x   : f32,
-    cam_world_y   : f32,
-    cam_world_z   : f32,
-    _pad2         : u32,
+    inv_view_proj  : mat4x4<f32>,  // offset 0   inv(P), unprojects NDC → view space
+    screen_width   : u32,          // offset 64
+    screen_height  : u32,          // offset 68
+    rays_per_pixel : u32,          // offset 72
+    frame_seed     : u32,          // offset 76
+    max_distance   : f32,          // offset 80
+    normal_bias    : f32,          // offset 84
+    debug_mode     : u32,          // offset 88
+    debug_mode2    : u32,          // offset 92
+    cam_world_x    : f32,          // offset 96
+    cam_world_y    : f32,          // offset 100
+    cam_world_z    : f32,          // offset 104
+    _pad2          : u32,          // offset 108
+    vtw_r0         : vec4<f32>,    // offset 112  row 0 of view→world 3×4 matrix
+    vtw_r1         : vec4<f32>,    // offset 128  row 1
+    vtw_r2         : vec4<f32>,    // offset 144  row 2
+    dyn_node_count : u32,          // offset 160  GPU LBVH nodes for skinned geo; 0 = none
+    _pad3a         : u32,          // offset 164
+    _pad3b         : u32,          // offset 168
+    _pad3c         : u32,          // offset 172
 }
 
 // ---- Bindings ---------------------------------------------------------------
@@ -578,6 +608,35 @@ struct Camera {
         s += std::to_string(i);
         s += " : texture_2d<f32>;\n";
     }
+    // Dynamic LBVH bindings (bindings 25 and 26).
+    // LbvhNode matches GpuBvhNode layout (48 bytes) with left/right children for stack traversal.
+    // DynBlasTri matches GpuTriangle layout (80 bytes) from GpuBvhBuilder; only positions read.
+    s += R"(
+@group(0) @binding(25) var<storage, read> dyn_blas_nodes : array<LbvhNode>;
+@group(0) @binding(26) var<storage, read> dyn_blas_tris  : array<DynBlasTri>;
+
+struct LbvhNode {
+    bounds_min  : vec3<f32>,  // offset 0
+    left_child  : u32,        // offset 12  (0xFFFFFFFF for leaf)
+    bounds_max  : vec3<f32>,  // offset 16
+    right_child : u32,        // offset 28
+    tri_offset  : u32,        // offset 32
+    tri_count   : u32,        // offset 36
+    _pad0       : u32,        // offset 40
+    _pad1       : u32,        // offset 44
+}
+
+struct DynBlasTri {
+    a    : vec3<f32>,  // offset 0
+    _p0  : f32,        // offset 12
+    b    : vec3<f32>,  // offset 16
+    _p1  : f32,        // offset 28
+    c    : vec3<f32>,  // offset 32
+    _p2  : f32,        // offset 44
+    _u0  : vec4<f32>,  // offset 48 (UVs — unused for skinned meshes)
+    _u1  : vec4<f32>,  // offset 64 (UVs + texIdx + flags — unused)
+}
+)";
     s += R"(
 
 // ---- PCG RNG ----------------------------------------------------------------
@@ -607,7 +666,24 @@ fn cosine_hemisphere(normal: vec3<f32>, seed: ptr<function, u32>) -> vec3<f32> {
     return lx * tangent + ly * bitangent + lz * normal;
 }
 
-// ---- AABB slab test (works for both TLAS view-space and BLAS local-space) ----
+// ---- View→world transform (for TLAS-level ray) ----
+// cam.vtw_r0/r1/r2 are the rows of the 3×4 view→world affine matrix.
+fn xf_vtw_point(p: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(
+        dot(cam.vtw_r0, vec4<f32>(p, 1.0)),
+        dot(cam.vtw_r1, vec4<f32>(p, 1.0)),
+        dot(cam.vtw_r2, vec4<f32>(p, 1.0))
+    );
+}
+fn xf_vtw_dir(d: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(
+        dot(cam.vtw_r0.xyz, d),
+        dot(cam.vtw_r1.xyz, d),
+        dot(cam.vtw_r2.xyz, d)
+    );
+}
+
+// ---- AABB slab test (world-space for TLAS, local-space for BLAS) ----
 fn aabb_hit(node: AcNode, origin: vec3<f32>, inv_dir: vec3<f32>, tmax: f32) -> bool {
     let t1 = (node.bounds_min - origin) * inv_dir;
     let t2 = (node.bounds_max - origin) * inv_dir;
@@ -693,37 +769,105 @@ fn traverse_blas(inst: TlasInstance, l_origin: vec3<f32>, l_dir: vec3<f32>,
     return 0u;
 }
 
-// ---- Two-level TLAS traversal (view space) ----
-// Returns 0=miss, 1=hit, 2=visit-limit reached.
-fn intersects_any(origin: vec3<f32>, dir: vec3<f32>, tmax: f32,
-                  acc_visits: ptr<function, u32>) -> u32 {
-    if (arrayLength(&tlas_nodes) == 0u || arrayLength(&tlas_instances) == 0u) { return 0u; }
+// ---- Dynamic LBVH traversal (view space, stack-based, GPU LBVH format) ----
+// Checks the skinned-mesh GPU LBVH.  The BVH and triangles are in view space so
+// no coordinate transform is needed — origin_view/dir_view are used directly.
+// Skipped immediately when cam.dyn_node_count == 0 (no dynamic geometry this frame).
+fn aabb_hit_lbvh(node: LbvhNode, origin: vec3<f32>, inv_dir: vec3<f32>, tmax: f32) -> bool {
+    let t1 = (node.bounds_min - origin) * inv_dir;
+    let t2 = (node.bounds_max - origin) * inv_dir;
+    let tmin_v = min(t1, t2);
+    let tmax_v = max(t1, t2);
+    let tmin_s = max(max(tmin_v.x, tmin_v.y), max(tmin_v.z, 0.0));
+    let tmax_s = min(min(tmax_v.x, tmax_v.y), min(tmax_v.z, tmax));
+    return tmin_s <= tmax_s;
+}
+
+fn dyn_ray_tri_hit(origin: vec3<f32>, dir: vec3<f32>, tri: DynBlasTri, tmax: f32) -> bool {
+    let e1 = tri.b - tri.a;
+    let e2 = tri.c - tri.a;
+    let h   = cross(dir, e2);
+    let det = dot(e1, h);
+    if (abs(det) < 1e-7) { return false; }
+    let inv_det = 1.0 / det;
+    let sv = origin - tri.a;
+    let u  = dot(sv, h) * inv_det;
+    if (u < 0.0 || u > 1.0) { return false; }
+    let q = cross(sv, e1);
+    let v = dot(dir, q) * inv_det;
+    if (v < 0.0 || u + v > 1.0) { return false; }
+    let t = dot(e2, q) * inv_det;
+    return (t > 1e-4 && t < tmax);
+}
+
+fn traverse_dyn_lbvh(origin: vec3<f32>, dir: vec3<f32>, tmax: f32,
+                      heat_acc: ptr<function, u32>) -> u32 {
+    if (cam.dyn_node_count == 0u) { return 0u; }
     let inv_dir = vec3<f32>(1.0/dir.x, 1.0/dir.y, 1.0/dir.z);
-    var idx: u32 = 0u;
-    var tlas_v: u32 = 0u;
+    var stk: array<u32, 64>;
+    var sp: i32 = 1; stk[0] = 0u;
+    var visits: u32 = 0u;
     loop {
-        if (idx == 0xFFFFFFFFu) { break; }
-        if (tlas_v >= kMaxTlasVisits) { *acc_visits += tlas_v; return 2u; }
-        tlas_v += 1u;
-        let node = tlas_nodes[idx];
-        if (!aabb_hit(node, origin, inv_dir, tmax)) {
-            idx = node.miss_next; continue;
-        }
-        if (node.tri_count == 1u) {  // TLAS leaf
-            let inst = tlas_instances[node.tri_offset];
-            let l_origin = xf_point(inst, origin);
-            let l_dir    = xf_dir(inst, dir);
-            let r = traverse_blas(inst, l_origin, l_dir, tmax, acc_visits);
-            if (r == 1u) { *acc_visits += tlas_v; return 1u; }
-            // r==2 means this BLAS hit its own cap; don't penalise the whole ray —
-            // mark as limit only if the TLAS budget itself is also exhausted.
-            idx = node.miss_next;
+        if (sp <= 0 || visits >= kMaxBlasVisits) { break; }
+        sp -= 1; visits += 1u;
+        let idx  = stk[u32(sp)];
+        let node = dyn_blas_nodes[idx];
+        if (!aabb_hit_lbvh(node, origin, inv_dir, tmax)) { continue; }
+        if (node.tri_count > 0u) {
+            for (var i = node.tri_offset; i < node.tri_offset + node.tri_count; i += 1u) {
+                if (dyn_ray_tri_hit(origin, dir, dyn_blas_tris[i], tmax)) {
+                    *heat_acc += visits; return 1u;
+                }
+            }
         } else {
-            idx = node.hit_next;
+            if (sp < 62) {
+                stk[u32(sp)] = node.right_child; sp += 1;
+                stk[u32(sp)] = node.left_child;  sp += 1;
+            }
         }
     }
-    *acc_visits += tlas_v;
-    return 0u;
+    *heat_acc += visits;
+    return select(0u, 2u, visits >= kMaxBlasVisits);
+}
+
+// ---- Two-level TLAS traversal (world space at TLAS, view space at BLAS) ----
+// origin_view/dir_view are in view space (from the depth unproject + hemisphere sample).
+// The TLAS is in world space; ray is converted once at the top.
+// BLAS leaves still receive the original view-space ray via pnMtxInv (view→local).
+// After the TLAS, the dynamic GPU LBVH (skinned geo, view space) is checked as a second pass.
+// Returns 0=miss, 1=hit, 2=visit-limit reached.
+fn intersects_any(origin_view: vec3<f32>, dir_view: vec3<f32>, tmax: f32,
+                  acc_visits: ptr<function, u32>) -> u32 {
+    if (arrayLength(&tlas_nodes) > 0u && arrayLength(&tlas_instances) > 0u) {
+        let origin  = xf_vtw_point(origin_view);
+        let dir     = xf_vtw_dir(dir_view);
+        let inv_dir = vec3<f32>(1.0/dir.x, 1.0/dir.y, 1.0/dir.z);
+        var idx: u32 = 0u;
+        var tlas_v: u32 = 0u;
+        loop {
+            if (idx == 0xFFFFFFFFu) { break; }
+            if (tlas_v >= kMaxTlasVisits) { *acc_visits += tlas_v; return 2u; }
+            tlas_v += 1u;
+            let node = tlas_nodes[idx];
+            if (!aabb_hit(node, origin, inv_dir, tmax)) {
+                idx = node.miss_next; continue;
+            }
+            if (node.tri_count == 1u) {  // TLAS leaf
+                let inst = tlas_instances[node.tri_offset];
+                let l_origin = xf_point(inst, origin_view);
+                let l_dir    = xf_dir(inst, dir_view);
+                let r = traverse_blas(inst, l_origin, l_dir, tmax, acc_visits);
+                if (r == 1u) { *acc_visits += tlas_v; return 1u; }
+                if (r == 2u) { *acc_visits += tlas_v; return 2u; }
+                idx = node.miss_next;
+            } else {
+                idx = node.hit_next;
+            }
+        }
+        *acc_visits += tlas_v;
+    }
+    // Second pass: dynamic (skinned) geometry via GPU LBVH in view space.
+    return traverse_dyn_lbvh(origin_view, dir_view, tmax, acc_visits);
 }
 
 // ---- Depth / unproject / normal (identical to LBVH shader) ----
@@ -771,8 +915,14 @@ fn estimate_normal(px: u32, py: u32, pos: vec3<f32>) -> vec3<f32> {
     if (dot(nn, normalize(-pos)) < 0.0) { nn = -nn; }
     return nn;
 }
-
+)";
+    s += R"(
 // ---- Main compute entry point ----
+// Dispatched at half resolution; each thread handles a 2×2 pixel block.
+// One depth/normal sample is shared across the block (same as before), but
+// the N-ray budget is split evenly among the four sub-pixels with independent
+// seeds so neighbouring pixels draw distinct sample sequences.
+// Distance LOD reduces the ray count for far geometry.
 @compute @workgroup_size(8, 8)
 fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let px = gid.x * 2u;
@@ -810,41 +960,92 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let dist_from_cam = length(pos);
     let ray_origin = pos + normal * max(dist_from_cam * cam.normal_bias, cam.normal_bias * 10.0);
-    var seed = pcg(((py * cam.screen_width + px) * 1664525u) ^ cam.frame_seed);
-    var hits: u32 = 0u; var limit_hits: u32 = 0u; var total_visits: u32 = 0u;
+
+    // Distance LOD: far surfaces get fewer rays; the A-trous denoiser covers residual noise.
     let N = cam.rays_per_pixel;
-    for (var i = 0u; i < N; i += 1u) {
-        let dir = cosine_hemisphere(normal, &seed);
-        let r = intersects_any(ray_origin, dir, cam.max_distance, &total_visits);
-        if (r == 1u) { hits       += 1u; }
-        if (r == 2u) { limit_hits += 1u; }
+    let lod_n = select(N,
+                    select(max(1u, N / 2u), 1u, dist_from_cam > cam.max_distance * 8.0),
+                    dist_from_cam > cam.max_distance * 4.0);
+
+    // Split the budget across the four sub-pixels (same total GPU work as before).
+    // Each sub-pixel uses a seed seeded from its own screen coordinate so adjacent
+    // pixels draw independent cosine-hemisphere sequences every frame.
+    let n_each = max(1u, lod_n / 4u);
+
+    var seed00 = pcg(((py        * cam.screen_width + px)        * 1664525u) ^ cam.frame_seed);
+    var hits00: u32 = 0u; var lim00: u32 = 0u; var vis00: u32 = 0u;
+    for (var i = 0u; i < n_each; i += 1u) {
+        let r = intersects_any(ray_origin, cosine_hemisphere(normal, &seed00), cam.max_distance, &vis00);
+        if (r == 1u) { hits00 += 1u; } if (r == 2u) { lim00 += 1u; }
     }
 
-    let valid = N - limit_hits;
-    let ao = select(0.5, 1.0 - f32(hits) / f32(valid), valid > 0u);
+    var seed10 = pcg(((py        * cam.screen_width + px + 1u)   * 1664525u) ^ cam.frame_seed);
+    var hits10: u32 = 0u; var lim10: u32 = 0u; var vis10: u32 = 0u;
+    for (var i = 0u; i < n_each; i += 1u) {
+        let r = intersects_any(ray_origin, cosine_hemisphere(normal, &seed10), cam.max_distance, &vis10);
+        if (r == 1u) { hits10 += 1u; } if (r == 2u) { lim10 += 1u; }
+    }
+
+    var seed01 = pcg((((py + 1u) * cam.screen_width + px)        * 1664525u) ^ cam.frame_seed);
+    var hits01: u32 = 0u; var lim01: u32 = 0u; var vis01: u32 = 0u;
+    for (var i = 0u; i < n_each; i += 1u) {
+        let r = intersects_any(ray_origin, cosine_hemisphere(normal, &seed01), cam.max_distance, &vis01);
+        if (r == 1u) { hits01 += 1u; } if (r == 2u) { lim01 += 1u; }
+    }
+
+    var seed11 = pcg((((py + 1u) * cam.screen_width + px + 1u)   * 1664525u) ^ cam.frame_seed);
+    var hits11: u32 = 0u; var lim11: u32 = 0u; var vis11: u32 = 0u;
+    for (var i = 0u; i < n_each; i += 1u) {
+        let r = intersects_any(ray_origin, cosine_hemisphere(normal, &seed11), cam.max_distance, &vis11);
+        if (r == 1u) { hits11 += 1u; } if (r == 2u) { lim11 += 1u; }
+    }
+
+    let valid00 = n_each - lim00; let ao00 = select(0.5, 1.0 - f32(hits00) / f32(valid00), valid00 > 0u);
+    let valid10 = n_each - lim10; let ao10 = select(0.5, 1.0 - f32(hits10) / f32(valid10), valid10 > 0u);
+    let valid01 = n_each - lim01; let ao01 = select(0.5, 1.0 - f32(hits01) / f32(valid01), valid01 > 0u);
+    let valid11 = n_each - lim11; let ao11 = select(0.5, 1.0 - f32(hits11) / f32(valid11), valid11 > 0u);
+
+    // Aggregate stats for debug views (based on c00 sub-pixel as representative).
+    let total_visits = vis00 + vis10 + vis01 + vis11;
+    let total_lim    = lim00 + lim10 + lim01 + lim11;
+    let total_n      = n_each * 4u;
 
     let root = tlas_nodes[0];
-    let root_hit = aabb_hit(root, pos, vec3<f32>(1.0/0.1, 1.0/0.1, 1.0/(-1.0)), cam.max_distance);
+    let root_hit = aabb_hit(root, xf_vtw_point(pos), vec3<f32>(1.0/0.1, 1.0/0.1, 1.0/(-1.0)), cam.max_distance);
 
-    var ao_val: vec4<f32>;
-    if (cam.debug_mode == 1u)      { ao_val = vec4<f32>(normal * 0.5 + 0.5, 1.0); }
-    else if (cam.debug_mode == 2u) { ao_val = vec4<f32>(dist_from_cam / 2000.0, 0.0, 0.0, 1.0); }
-    else if (cam.debug_mode == 3u) { ao_val = select(vec4<f32>(1.0,0.0,0.0,1.0), vec4<f32>(0.0,1.0,0.0,1.0), root_hit); }
-    else                           { ao_val = vec4<f32>(ao, ao, ao, 1.0); }
+    // Debug/non-AO modes produce one value shared across the block; AO mode writes
+    // the unique per-sub-pixel estimate so the denoiser sees four distinct samples.
+    var ao_val00: vec4<f32>; var ao_val10: vec4<f32>;
+    var ao_val01: vec4<f32>; var ao_val11: vec4<f32>;
+    if (cam.debug_mode == 1u) {
+        let v = vec4<f32>(normal * 0.5 + 0.5, 1.0);
+        ao_val00 = v; ao_val10 = v; ao_val01 = v; ao_val11 = v;
+    } else if (cam.debug_mode == 2u) {
+        let v = vec4<f32>(dist_from_cam / 2000.0, 0.0, 0.0, 1.0);
+        ao_val00 = v; ao_val10 = v; ao_val01 = v; ao_val11 = v;
+    } else if (cam.debug_mode == 3u) {
+        let v = select(vec4<f32>(1.0,0.0,0.0,1.0), vec4<f32>(0.0,1.0,0.0,1.0), root_hit);
+        ao_val00 = v; ao_val10 = v; ao_val01 = v; ao_val11 = v;
+    } else {
+        ao_val00 = vec4<f32>(ao00, ao00, ao00, 1.0);
+        ao_val10 = vec4<f32>(ao10, ao10, ao10, 1.0);
+        ao_val01 = vec4<f32>(ao01, ao01, ao01, 1.0);
+        ao_val11 = vec4<f32>(ao11, ao11, ao11, 1.0);
+    }
 
     var lim_val: vec4<f32>;
-    if (cam.debug_mode2 == 1u)      { lim_val = vec4<f32>(ao, ao, ao, 1.0); }
+    if (cam.debug_mode2 == 1u)      { lim_val = vec4<f32>(ao00, ao00, ao00, 1.0); }
     else if (cam.debug_mode2 == 2u) { lim_val = vec4<f32>(normal * 0.5 + 0.5, 1.0); }
     else if (cam.debug_mode2 == 3u) { lim_val = vec4<f32>(dist_from_cam / 2000.0, 0.0, 0.0, 1.0); }
     else if (cam.debug_mode2 == 4u) { lim_val = select(vec4<f32>(1.0,0.0,0.0,1.0), vec4<f32>(0.0,1.0,0.0,1.0), root_hit); }
-    else if (cam.debug_mode2 == 5u) { lim_val = vec4<f32>(min(f32(total_visits) / f32(N * 256u), 1.0), 0.0, 0.0, 1.0); }
-    else if (cam.debug_mode2 == 6u) { lim_val = vec4<f32>(f32(limit_hits)/f32(N), 0.0, f32(limit_hits)/f32(N), 1.0); }
-    else                            { lim_val = select(vec4<f32>(0.0,0.0,0.0,1.0), vec4<f32>(1.0,0.0,1.0,1.0), limit_hits > N/2u); }
+    else if (cam.debug_mode2 == 5u) { lim_val = vec4<f32>(min(f32(total_visits) / f32(total_n * 256u), 1.0), 0.0, 0.0, 1.0); }
+    else if (cam.debug_mode2 == 6u) { lim_val = vec4<f32>(f32(total_lim)/f32(total_n), 0.0, f32(total_lim)/f32(total_n), 1.0); }
+    else                            { lim_val = select(vec4<f32>(0.0,0.0,0.0,1.0), vec4<f32>(1.0,0.0,1.0,1.0), total_lim > total_n / 2u); }
 
-    textureStore(ao_out, c00, ao_val);
-    if (c10.x < W) { textureStore(ao_out, c10, ao_val); }
-    if (c01.y < H) { textureStore(ao_out, c01, ao_val); }
-    if (c10.x < W && c01.y < H) { textureStore(ao_out, c11, ao_val); }
+    textureStore(ao_out, c00, ao_val00);
+    if (c10.x < W) { textureStore(ao_out, c10, ao_val10); }
+    if (c01.y < H) { textureStore(ao_out, c01, ao_val01); }
+    if (c10.x < W && c01.y < H) { textureStore(ao_out, c11, ao_val11); }
     textureStore(limits_out, c00, lim_val);
     if (c10.x < W) { textureStore(limits_out, c10, lim_val); }
     if (c01.y < H) { textureStore(limits_out, c01, lim_val); }
@@ -878,6 +1079,8 @@ static WGPUBuffer create_buffer(WGPUDevice device, uint64_t size, WGPUBufferUsag
 // ---------------------------------------------------------------------------
 
 AoPass::~AoPass() {
+    if (m_dynDummyNodeBuf) wgpuBufferRelease(m_dynDummyNodeBuf);
+    if (m_dynDummyTriBuf)  wgpuBufferRelease(m_dynDummyTriBuf);
     if (m_tlasBindGroup)  wgpuBindGroupRelease(m_tlasBindGroup);
     if (m_tlasBgl)        wgpuBindGroupLayoutRelease(m_tlasBgl);
     if (m_tlasPipeline)   wgpuComputePipelineRelease(m_tlasPipeline);
@@ -984,8 +1187,9 @@ void AoPass::ensure_tlas_pipeline(WGPUDevice device) {
     smDesc.nextInChain = &wgslSrc.chain;
     WGPUShaderModule sm = wgpuDeviceCreateShaderModule(device, &smDesc);
 
-    // 9 fixed bindings (0-8) + 1 sampler (6) + 16 alpha textures (9-24) = 25 total
-    WGPUBindGroupLayoutEntry entries[25] = {};
+    // 9 fixed bindings (0-8) + 1 sampler (6) + 16 alpha textures (9-24)
+    // + 2 dynamic LBVH buffers (25-26) = 27 total
+    WGPUBindGroupLayoutEntry entries[27] = {};
 
     // 0: TLAS nodes
     entries[0].binding = 0; entries[0].visibility = WGPUShaderStage_Compute;
@@ -1013,10 +1217,10 @@ void AoPass::ensure_tlas_pipeline(WGPUDevice device) {
     // 6: Sampler
     entries[6].binding = 6; entries[6].visibility = WGPUShaderStage_Compute;
     entries[6].sampler.type = WGPUSamplerBindingType_Filtering;
-    // 7: Monolithic BLAS nodes
+    // 7: Monolithic BLAS nodes (static geometry only)
     entries[7].binding = 7; entries[7].visibility = WGPUShaderStage_Compute;
     entries[7].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
-    // 8: Monolithic BLAS tris
+    // 8: Monolithic BLAS tris (static geometry only)
     entries[8].binding = 8; entries[8].visibility = WGPUShaderStage_Compute;
     entries[8].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
     // 9-24: Alpha textures
@@ -1026,9 +1230,15 @@ void AoPass::ensure_tlas_pipeline(WGPUDevice device) {
         entries[9 + i].texture.sampleType    = WGPUTextureSampleType_Float;
         entries[9 + i].texture.viewDimension = WGPUTextureViewDimension_2D;
     }
+    // 25: Dynamic LBVH nodes (skinned geo, GPU LBVH format — empty dummy when no dyn geo)
+    entries[25].binding = 25; entries[25].visibility = WGPUShaderStage_Compute;
+    entries[25].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
+    // 26: Dynamic LBVH tris (GpuTriangle 80-byte format, positions only used)
+    entries[26].binding = 26; entries[26].visibility = WGPUShaderStage_Compute;
+    entries[26].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
 
     WGPUBindGroupLayoutDescriptor bglDesc{};
-    bglDesc.entryCount = 25;
+    bglDesc.entryCount = 27;
     bglDesc.entries    = entries;
     m_tlasBgl = wgpuDeviceCreateBindGroupLayout(device, &bglDesc);
 
@@ -1050,7 +1260,23 @@ void AoPass::ensure_tlas_pipeline(WGPUDevice device) {
 void AoPass::rebuild_tlas_bind_group(WGPUDevice device) {
     if (m_tlasBindGroup) { wgpuBindGroupRelease(m_tlasBindGroup); m_tlasBindGroup = nullptr; }
 
-    WGPUBindGroupEntry entries[25] = {};
+    // Create 4-byte dummy storage buffers for dynamic LBVH when no skinned geometry exists.
+    // The shader guards against access via cam.dyn_node_count == 0.
+    if (!m_dynDummyNodeBuf) {
+        WGPUBufferDescriptor d{}; d.size = 4;
+        d.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
+        m_dynDummyNodeBuf = wgpuDeviceCreateBuffer(device, &d);
+    }
+    if (!m_dynDummyTriBuf) {
+        WGPUBufferDescriptor d{}; d.size = 4;
+        d.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
+        m_dynDummyTriBuf = wgpuDeviceCreateBuffer(device, &d);
+    }
+
+    WGPUBuffer dynNodeBuf = m_tlasLastDynNodeBuf ? m_tlasLastDynNodeBuf : m_dynDummyNodeBuf;
+    WGPUBuffer dynTriBuf  = m_tlasLastDynTriBuf  ? m_tlasLastDynTriBuf  : m_dynDummyTriBuf;
+
+    WGPUBindGroupEntry entries[27] = {};
     entries[0].binding = 0; entries[0].buffer = m_tlasLastNodeBuf;     entries[0].size = WGPU_WHOLE_SIZE;
     entries[1].binding = 1; entries[1].buffer = m_tlasLastInstBuf;     entries[1].size = WGPU_WHOLE_SIZE;
     entries[2].binding = 2; entries[2].buffer = m_cameraUbo;           entries[2].size = sizeof(GpuCamera);
@@ -1067,10 +1293,12 @@ void AoPass::rebuild_tlas_bind_group(WGPUDevice device) {
             ? static_cast<WGPUTextureView>(m_lastTexViews[i])
             : m_fallbackView;
     }
+    entries[25].binding = 25; entries[25].buffer = dynNodeBuf; entries[25].size = WGPU_WHOLE_SIZE;
+    entries[26].binding = 26; entries[26].buffer = dynTriBuf;  entries[26].size = WGPU_WHOLE_SIZE;
 
     WGPUBindGroupDescriptor bgd{};
     bgd.layout     = m_tlasBgl;
-    bgd.entryCount = 25;
+    bgd.entryCount = 27;
     bgd.entries    = entries;
     m_tlasBindGroup      = wgpuDeviceCreateBindGroup(device, &bgd);
     m_tlasBindGroupDirty = false;
@@ -1260,16 +1488,20 @@ void AoPass::execute_tlas(WGPUDevice device, WGPUCommandEncoder encoder,
                           const GeometryCollector::CameraData& cam,
                           WGPUBuffer tlasNodeBuf, WGPUBuffer instanceBuf,
                           WGPUBuffer blasNodeBuf, WGPUBuffer blasTriBuf,
+                          WGPUBuffer dynNodeBuf, WGPUBuffer dynTriBuf, uint32_t dynNodeCount,
                           const std::vector<void*>& texViews) {
     if (!cam.valid || !depthTex) return;
     if (!tlasNodeBuf || !instanceBuf || !blasNodeBuf || !blasTriBuf) return;
 
     if (tlasNodeBuf != m_tlasLastNodeBuf || instanceBuf != m_tlasLastInstBuf ||
-        blasNodeBuf != m_tlasLastBlasNodeBuf || blasTriBuf != m_tlasLastBlasTriBuf) {
+        blasNodeBuf != m_tlasLastBlasNodeBuf || blasTriBuf != m_tlasLastBlasTriBuf ||
+        dynNodeBuf  != m_tlasLastDynNodeBuf  || dynTriBuf  != m_tlasLastDynTriBuf) {
         m_tlasLastNodeBuf     = tlasNodeBuf;
         m_tlasLastInstBuf     = instanceBuf;
         m_tlasLastBlasNodeBuf = blasNodeBuf;
         m_tlasLastBlasTriBuf  = blasTriBuf;
+        m_tlasLastDynNodeBuf  = dynNodeBuf;
+        m_tlasLastDynTriBuf   = dynTriBuf;
         m_tlasBindGroupDirty  = true;
     }
     if (texViews != m_lastTexViews) {
@@ -1299,6 +1531,12 @@ void AoPass::execute_tlas(WGPUDevice device, WGPUCommandEncoder encoder,
     gpuCam.debugMode    = m_params.debugMode;
     gpuCam.debugMode2   = m_params.debugMode2;
     if (!compute_inv_proj(cam, gpuCam.invViewProj)) return;
+    // Default viewToWorld to identity; overwrite if view matrix is populated.
+    gpuCam.viewToWorld[0]=1; gpuCam.viewToWorld[1]=0; gpuCam.viewToWorld[2]=0;  gpuCam.viewToWorld[3]=0;
+    gpuCam.viewToWorld[4]=0; gpuCam.viewToWorld[5]=1; gpuCam.viewToWorld[6]=0;  gpuCam.viewToWorld[7]=0;
+    gpuCam.viewToWorld[8]=0; gpuCam.viewToWorld[9]=0; gpuCam.viewToWorld[10]=1; gpuCam.viewToWorld[11]=0;
+    compute_view_to_world(cam, gpuCam.viewToWorld);
+    gpuCam.dynNodeCount = dynNodeCount;
 
     if (!m_cameraUbo) {
         m_cameraUbo = create_buffer(device, sizeof(GpuCamera), WGPUBufferUsage_Uniform);
