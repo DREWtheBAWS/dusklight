@@ -112,6 +112,11 @@ public:
     // Raw view-space skinned triangles for this frame (fed to GPU LBVH builder).
     const std::vector<Triangle>& dynamic_triangles() const { return m_dynamicTrisBuf; }
 
+    // Match the distance filter applied by GeometryCollector so far-field skinned triangles
+    // are excluded before the GPU LBVH build.  Pass 0 to disable.  Set each frame to the
+    // same value as GeometryCollector::set_max_distance().
+    void set_max_distance(float r) { m_maxDistSq = (r > 0.f) ? r * r : 0.f; }
+
     // Per-frame build budget: limits per-frame CPU cost while new areas are explored.
     // After kMaxEntries BLASes are cached the queue drains and subsequent frames are free.
     static constexpr uint32_t kEvictAfterFrames  = 300;   // ~5 s at 60 fps — reduces re-eviction churn when panning
@@ -142,6 +147,7 @@ private:
 
     // Dynamic (skinned) triangles — view-space, accumulated per frame, fed to GPU LBVH.
     std::vector<Triangle> m_dynamicTrisBuf;
+    float                 m_maxDistSq = 0.f; // centroid distance² filter (0 = disabled)
 };
 
 } // namespace dusk::rtao

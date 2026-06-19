@@ -76,6 +76,8 @@ namespace dusk {
         bool  m_excludeSkinned  = false;  // debug: skip dynamic LBVH for skinned meshes
         bool     m_aoEnabled          = true;   // apply composite pass to the EFB
         float    m_aoStrength         = 1.0f;   // [0,1] blend factor for AO composite
+        bool     m_shadowEnabled      = true;   // run RT shadow pass each frame
+        float    m_shadowStrength     = 0.0f;   // [0,1] blend factor for shadow composite
         bool     m_denoiseEnabled     = true;
         int      m_denoiseIterations  = 4;
         float    m_denoiseSigmaZ      = 1.0f;
@@ -87,6 +89,7 @@ namespace dusk {
         dusk::rtao::GpuBvhBuilder      m_bvhBuilder;
         dusk::rtao::AoPass             m_aoPass;
         dusk::rtao::AoDenoisePass      m_denoisePass;
+        dusk::rtao::AoDenoisePass      m_shadowDenoisePass;
         dusk::rtao::AoCompositePass    m_compositePass;
     };
 }

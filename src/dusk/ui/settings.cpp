@@ -962,6 +962,22 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
             "smoother results at a small GPU cost. Set to 0 to disable denoising.",
             0, 5, 1,
             [] { return !getSettings().game.rtaoEnabled.getValue(); });
+        config_bool_select(leftPane, rightPane, getSettings().game.rtShadowEnabled, {
+            .key = "RT Shadows",
+            .helpText =
+                "Enable raytraced sun shadows. Casts rays from every surface pixel toward the sun "
+                "and darkens pixels that are occluded by geometry. The game's built-in shadow "
+                "rendering is suppressed while this is active to avoid double-shadow artifacts. "
+                "Requires Ray Tracing to be enabled.",
+            .isDisabled = [] { return !getSettings().game.rtaoEnabled.getValue(); },
+        });
+        config_percent_select(leftPane, rightPane, getSettings().game.rtShadowIntensity,
+            "Shadow Intensity",
+            "Blend strength of the raytraced shadow effect. 100% applies full shadow darkening; "
+            "lower values produce a more subtle effect.",
+            0, 100, 5,
+            [] { return !getSettings().game.rtaoEnabled.getValue() ||
+                        !getSettings().game.rtShadowEnabled.getValue(); });
     });
 
     add_tab("Input", [this](Rml::Element* content) {

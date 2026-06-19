@@ -68,14 +68,21 @@ uint32_t BlasCache::record_draw(const AuroraGxCaptureDraw& draw) {
         }
         if (isMultiMatrix) {
             ++m_rejectedSkinned;
-            // Decode view-space triangles for the per-frame dynamic BLAS.
-            // decode_triangles() applies per-vertex pnMtx to produce view-space positions.
+            // Decode view-space triangles for the GPU LBVH.  Apply the same per-triangle
+            // distance filter as GeometryCollector (set via set_max_distance()) so that
+            // characters beyond the AO range don't pollute the LBVH with out-of-range data.
             if (m_dynamicTrisBuf.size() < kMaxDynTris) {
                 auto viewTris = decode_triangles(draw);
-                const uint32_t room = kMaxDynTris - static_cast<uint32_t>(m_dynamicTrisBuf.size());
-                const uint32_t take = std::min(static_cast<uint32_t>(viewTris.size()), room);
-                m_dynamicTrisBuf.insert(m_dynamicTrisBuf.end(),
-                                        viewTris.begin(), viewTris.begin() + take);
+                for (const Triangle& t : viewTris) {
+                    if (m_dynamicTrisBuf.size() >= kMaxDynTris) break;
+                    if (m_maxDistSq > 0.f) {
+                        const float cx = (t.a.x + t.b.x + t.c.x) * (1.f / 3.f);
+                        const float cy = (t.a.y + t.b.y + t.c.y) * (1.f / 3.f);
+                        const float cz = (t.a.z + t.b.z + t.c.z) * (1.f / 3.f);
+                        if (cx*cx + cy*cy + cz*cz > m_maxDistSq) continue;
+                    }
+                    m_dynamicTrisBuf.push_back(t);
+                }
             }
             return 0;
         }

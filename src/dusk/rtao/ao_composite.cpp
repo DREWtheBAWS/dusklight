@@ -30,28 +30,33 @@ fn vs_main(@builtin(vertex_index) vi : u32) -> VertOut {
 @group(0) @binding(0) var u_sampler : sampler;
 @group(0) @binding(1) var t_color   : texture_2d<f32>;
 @group(0) @binding(2) var t_ao      : texture_2d<f32>;
+@group(0) @binding(3) var t_shadow  : texture_2d<f32>;
 
-struct Params { strength : f32 };
-@group(0) @binding(3) var<uniform> u_params : Params;
+struct Params { ao_strength : f32, shadow_strength : f32, _pad0 : f32, _pad1 : f32 };
+@group(0) @binding(4) var<uniform> u_params : Params;
 
 @fragment
 fn fs_main(in : VertOut) -> @location(0) vec4<f32> {
-    let color = textureSample(t_color, u_sampler, in.uv);
-    let ao    = textureSample(t_ao,    u_sampler, in.uv).r;
-    let scale = mix(1.0, ao, u_params.strength);
+    let color  = textureSample(t_color,  u_sampler, in.uv);
+    let ao     = textureSample(t_ao,     u_sampler, in.uv).r;
+    let shadow = textureSample(t_shadow, u_sampler, in.uv).r;
+    let scale  = mix(1.0, ao,     u_params.ao_strength)
+               * mix(1.0, shadow, u_params.shadow_strength);
     return vec4<f32>(color.rgb * scale, color.a);
 }
 )";
 
 AoCompositePass::~AoCompositePass() {
-    if (m_bindGroup)       wgpuBindGroupRelease(m_bindGroup);
-    if (m_bgl)             wgpuBindGroupLayoutRelease(m_bgl);
-    if (m_pipeline)        wgpuRenderPipelineRelease(m_pipeline);
-    if (m_sampler)         wgpuSamplerRelease(m_sampler);
-    if (m_paramsUbo)       wgpuBufferRelease(m_paramsUbo);
-    if (m_scratchView)     wgpuTextureViewRelease(m_scratchView);
-    if (m_scratchTex)      wgpuTextureRelease(m_scratchTex);
+    if (m_bindGroup)        wgpuBindGroupRelease(m_bindGroup);
+    if (m_bgl)              wgpuBindGroupLayoutRelease(m_bgl);
+    if (m_pipeline)         wgpuRenderPipelineRelease(m_pipeline);
+    if (m_sampler)          wgpuSamplerRelease(m_sampler);
+    if (m_paramsUbo)        wgpuBufferRelease(m_paramsUbo);
+    if (m_scratchView)      wgpuTextureViewRelease(m_scratchView);
+    if (m_scratchTex)       wgpuTextureRelease(m_scratchTex);
     if (m_colorSampledView) wgpuTextureViewRelease(m_colorSampledView);
+    if (m_whiteView)        wgpuTextureViewRelease(m_whiteView);
+    if (m_whiteTex)         wgpuTextureRelease(m_whiteTex);
 }
 
 void AoCompositePass::ensure_pipeline(WGPUDevice device, WGPUTextureFormat fmt) {
@@ -70,7 +75,7 @@ void AoCompositePass::ensure_pipeline(WGPUDevice device, WGPUTextureFormat fmt) 
     smDesc.nextInChain  = &wgslSrc.chain;
     WGPUShaderModule sm = wgpuDeviceCreateShaderModule(device, &smDesc);
 
-    WGPUBindGroupLayoutEntry bglEntries[4] = {};
+    WGPUBindGroupLayoutEntry bglEntries[5] = {};
 
     bglEntries[0].binding      = 0;
     bglEntries[0].visibility   = WGPUShaderStage_Fragment;
@@ -86,13 +91,18 @@ void AoCompositePass::ensure_pipeline(WGPUDevice device, WGPUTextureFormat fmt) 
     bglEntries[2].texture.sampleType    = WGPUTextureSampleType_Float;
     bglEntries[2].texture.viewDimension = WGPUTextureViewDimension_2D;
 
-    bglEntries[3].binding             = 3;
-    bglEntries[3].visibility          = WGPUShaderStage_Fragment;
-    bglEntries[3].buffer.type         = WGPUBufferBindingType_Uniform;
-    bglEntries[3].buffer.minBindingSize = sizeof(float);
+    bglEntries[3].binding               = 3;
+    bglEntries[3].visibility            = WGPUShaderStage_Fragment;
+    bglEntries[3].texture.sampleType    = WGPUTextureSampleType_Float;
+    bglEntries[3].texture.viewDimension = WGPUTextureViewDimension_2D;
+
+    bglEntries[4].binding               = 4;
+    bglEntries[4].visibility            = WGPUShaderStage_Fragment;
+    bglEntries[4].buffer.type           = WGPUBufferBindingType_Uniform;
+    bglEntries[4].buffer.minBindingSize = 16;
 
     WGPUBindGroupLayoutDescriptor bglDesc{};
-    bglDesc.entryCount = 4;
+    bglDesc.entryCount = 5;
     bglDesc.entries    = bglEntries;
     m_bgl = wgpuDeviceCreateBindGroupLayout(device, &bglDesc);
 
@@ -165,7 +175,28 @@ void AoCompositePass::rebuild_scratch(WGPUDevice device, uint32_t w, uint32_t h,
 void AoCompositePass::rebuild_bind_group(WGPUDevice device) {
     if (m_bindGroup) { wgpuBindGroupRelease(m_bindGroup); m_bindGroup = nullptr; }
 
-    WGPUBindGroupEntry entries[4] = {};
+    // Create 1×1 white fallback for when shadow texture is not yet available.
+    if (!m_whiteTex) {
+        WGPUTextureDescriptor td{};
+        td.usage         = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+        td.dimension     = WGPUTextureDimension_2D;
+        td.size          = {1, 1, 1};
+        td.format        = WGPUTextureFormat_RGBA8Unorm;
+        td.mipLevelCount = 1; td.sampleCount = 1;
+        m_whiteTex  = wgpuDeviceCreateTexture(device, &td);
+        m_whiteView = wgpuTextureCreateView(m_whiteTex, nullptr);
+        const uint8_t white[4] = {255, 255, 255, 255};
+        WGPUQueue q = wgpuDeviceGetQueue(device);
+        WGPUTexelCopyTextureInfo ict{}; ict.texture = m_whiteTex;
+        WGPUTexelCopyBufferLayout tdl{}; tdl.bytesPerRow = 4; tdl.rowsPerImage = 1;
+        WGPUExtent3D ext{1, 1, 1};
+        wgpuQueueWriteTexture(q, &ict, white, 4, &tdl, &ext);
+        wgpuQueueRelease(q);
+    }
+
+    WGPUTextureView shadowView = m_lastShadowView ? m_lastShadowView : m_whiteView;
+
+    WGPUBindGroupEntry entries[5] = {};
     entries[0].binding     = 0;
     entries[0].sampler     = m_sampler;
     entries[1].binding     = 1;
@@ -173,19 +204,21 @@ void AoCompositePass::rebuild_bind_group(WGPUDevice device) {
     entries[2].binding     = 2;
     entries[2].textureView = m_lastAoView;
     entries[3].binding     = 3;
-    entries[3].buffer      = m_paramsUbo;
-    entries[3].size        = 16;
+    entries[3].textureView = shadowView;
+    entries[4].binding     = 4;
+    entries[4].buffer      = m_paramsUbo;
+    entries[4].size        = 16;
 
     WGPUBindGroupDescriptor bgDesc{};
     bgDesc.layout     = m_bgl;
-    bgDesc.entryCount = 4;
+    bgDesc.entryCount = 5;
     bgDesc.entries    = entries;
     m_bindGroup = wgpuDeviceCreateBindGroup(device, &bgDesc);
 }
 
 void AoCompositePass::execute(WGPUDevice device, WGPUCommandEncoder encoder,
-                               WGPUTexture colorTex, WGPUTextureView aoView,
-                               float strength) {
+                               WGPUTexture colorTex, WGPUTextureView aoView, float aoStrength,
+                               WGPUTextureView shadowView, float shadowStrength) {
     if (!colorTex || !aoView) return;
 
     const uint32_t          w   = wgpuTextureGetWidth(colorTex);
@@ -210,12 +243,16 @@ void AoCompositePass::execute(WGPUDevice device, WGPUCommandEncoder encoder,
         m_lastAoView = aoView;
         bgDirty = true;
     }
+    if (shadowView != m_lastShadowView) {
+        m_lastShadowView = shadowView;
+        bgDirty = true;
+    }
     if (bgDirty || !m_bindGroup)
         rebuild_bind_group(device);
 
-    // Update strength uniform (16 bytes: float + 12 bytes padding).
-    struct alignas(16) ParamsData { float strength; float pad[3]; };
-    const ParamsData params{strength, {}};
+    // Update params uniform: {ao_strength, shadow_strength, pad, pad} = 16 bytes.
+    struct alignas(16) ParamsData { float ao_strength; float shadow_strength; float pad[2]; };
+    const ParamsData params{aoStrength, shadowStrength, {}};
     WGPUQueue q = wgpuDeviceGetQueue(device);
     wgpuQueueWriteBuffer(q, m_paramsUbo, 0, &params, sizeof(params));
     wgpuQueueRelease(q);

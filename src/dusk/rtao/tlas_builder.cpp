@@ -233,7 +233,8 @@ void TlasBuilder::build(const BlasCache& cache, const float viewMtx[4][4]) {
     // path if blasKey sequence changes or any instance is unmatchable.
     // ---------------------------------------------------------------------------
     const bool genStable = (cache.generation() == m_lastBlasGeneration);
-    bool fastPathOk = genStable
+    bool fastPathOk = !m_forceRebuild
+                   && genStable
                    && instances.size() == m_lastCacheInstCount
                    && !m_instances.empty()
                    && m_instanceDrawIdx.size() == m_instances.size();
@@ -394,6 +395,11 @@ void TlasBuilder::build(const BlasCache& cache, const float viewMtx[4][4]) {
             }
             m_tlasInstDirty = (h != m_lastInstHash);
             m_lastInstHash  = h;
+        }
+
+        if (m_forceRebuild) {
+            m_tlasNodesDirty = true;
+            m_tlasInstDirty  = true;
         }
 
         m_lastStats.cached     = !m_tlasNodesDirty;
@@ -568,7 +574,7 @@ void TlasBuilder::flush(WGPUDevice device) {
         return;
     }
 
-    // Static-only BLAS buffer (no dynamic tail in Phase 3 — skinned geo uses GPU LBVH).
+    // Monolithic BLAS buffer: static region (cached) + dynamic tail (re-uploaded every frame).
     {
         const uint32_t minNodes = std::max(m_staticBlasNodeCount, 1u);
         const uint32_t minTris  = std::max(m_staticBlasTriCount,  1u);
@@ -580,7 +586,7 @@ void TlasBuilder::flush(WGPUDevice device) {
             d.size  = uint64_t(m_blasNodeBufCapacity) * sizeof(BlasCache::GpuNode);
             d.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
             m_blasNodeBuf = wgpuDeviceCreateBuffer(device, &d);
-            m_blasNodesDirty = true;
+            m_blasNodesDirty = true;  // must re-upload static region after buffer recreate
         }
         if (!m_blasTriBuf || minTris > m_blasTriBufCapacity) {
             release_buf(m_blasTriBuf);
@@ -592,12 +598,12 @@ void TlasBuilder::flush(WGPUDevice device) {
             m_blasNodesDirty = true;
         }
 
+        WGPUQueue q = wgpuDeviceGetQueue(device);
+
         if (m_blasNodesDirty) {
-            // Upload only the newly-appended delta (from m_uploadedNodeCount onward) unless a full
-            // rebuild was triggered by eviction, in which case we upload everything from offset 0.
+            // Upload only the newly-appended delta unless a full rebuild was triggered.
             const uint32_t nodeStart = m_blasFullRebuildPending ? 0 : m_uploadedNodeCount;
             const uint32_t triStart  = m_blasFullRebuildPending ? 0 : m_uploadedTriCount;
-            WGPUQueue q = wgpuDeviceGetQueue(device);
             if (m_staticBlasNodeCount > nodeStart)
                 wgpuQueueWriteBuffer(q, m_blasNodeBuf,
                     uint64_t(nodeStart) * sizeof(BlasCache::GpuNode),
@@ -608,12 +614,13 @@ void TlasBuilder::flush(WGPUDevice device) {
                     uint64_t(triStart) * sizeof(BlasCache::GpuTri),
                     m_pendingBlasTris.data() + triStart,
                     (m_staticBlasTriCount - triStart) * sizeof(BlasCache::GpuTri));
-            wgpuQueueRelease(q);
             m_blasNodesDirty         = false;
             m_blasFullRebuildPending = false;
             m_uploadedNodeCount      = m_staticBlasNodeCount;
             m_uploadedTriCount       = m_staticBlasTriCount;
         }
+
+        wgpuQueueRelease(q);
     }
 
     // Update stats; keep node count / root AABB from the last full rebuild when nodes are cached.

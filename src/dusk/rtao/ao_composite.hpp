@@ -11,12 +11,14 @@ class AoCompositePass {
 public:
     ~AoCompositePass();
 
-    // colorTex — aurora_get_color_texture() (the EFB; TextureBinding + CopyDst)
-    // aoView   — AoPass::ao_texture_view()  (RGBA8Unorm, same resolution as EFB)
-    // strength — [0, 1]: 0 = no AO, 1 = full AO
+    // colorTex      — aurora_get_color_texture() (the EFB; TextureBinding + CopyDst)
+    // aoView        — AoPass::ao_texture_view()     (RGBA8Unorm)
+    // aoStrength    — [0, 1]: 0 = no AO, 1 = full AO
+    // shadowView    — AoPass::shadow_texture_view() (RGBA8Unorm, R=lit factor); nullptr = no shadow
+    // shadowStrength — [0, 1]: 0 = no shadow effect, 1 = full shadow
     void execute(WGPUDevice device, WGPUCommandEncoder encoder,
-                 WGPUTexture colorTex, WGPUTextureView aoView,
-                 float strength);
+                 WGPUTexture colorTex, WGPUTextureView aoView, float aoStrength,
+                 WGPUTextureView shadowView = nullptr, float shadowStrength = 0.f);
 
 private:
     void ensure_pipeline(WGPUDevice device, WGPUTextureFormat fmt);
@@ -37,7 +39,12 @@ private:
     WGPUTexture     m_lastColorTex       = nullptr;
     WGPUTextureView m_colorSampledView   = nullptr;
 
-    WGPUTextureView m_lastAoView = nullptr;
+    WGPUTextureView m_lastAoView     = nullptr;
+    WGPUTextureView m_lastShadowView = nullptr;
+
+    // 1×1 fully opaque white — used as fallback when no shadow texture is available.
+    WGPUTexture     m_whiteTex  = nullptr;
+    WGPUTextureView m_whiteView = nullptr;
 
     uint32_t          m_width     = 0;
     uint32_t          m_height    = 0;

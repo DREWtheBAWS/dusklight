@@ -70,6 +70,11 @@ public:
     // Use to verify static-geometry caching without animated characters dirtying the hash.
     void set_exclude_skinned(bool v) { m_excludeSkinned = v; }
 
+    // Debug: when true, always run the full slow-path rebuild every frame (disables the
+    // fast-path instance-list check and structural-hash caching).  Use to rule out stale
+    // TLAS data as the cause of artifacts in large areas.
+    void set_force_rebuild(bool v) { m_forceRebuild = v; }
+
     ~TlasBuilder();
 
     // CPU phase: collect instances, compute world-space AABBs, build SAH BVH.
@@ -143,6 +148,7 @@ private:
     std::unordered_set<size_t> m_dedupSeen;
 
     bool     m_excludeSkinned   = false; // debug: skip dynamic BLAS instance
+    bool     m_forceRebuild     = false; // debug: always run full slow-path rebuild
 
     // Split-hash caching: structural hash covers world-space AABBs + BLAS refs (camera-independent).
     // Instance hash covers pnMtxInv (view-dependent — changes when camera moves).

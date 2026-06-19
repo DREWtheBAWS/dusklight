@@ -35,7 +35,7 @@ struct GpuTriangle {
 };
 static_assert(sizeof(GpuTriangle) == 80);
 
-// 176 bytes — matches WGSL Camera uniform (both LBVH and TLAS shaders)
+// 192 bytes — matches WGSL Camera uniform (LBVH, TLAS AO, and shadow shaders)
 struct GpuCamera {
     float    invViewProj[16]; // col-major mat4x4 = inv(P), offset 0; unprojects NDC → view space
     uint32_t screenWidth;     // offset 64
@@ -53,8 +53,12 @@ struct GpuCamera {
     float    viewToWorld[12]; // offset 112 view→world 3×4 affine matrix, row-major
     uint32_t dynNodeCount;    // offset 160 GPU LBVH node count for dynamic (skinned) geometry; 0=none
     uint32_t _pad3[3];        // offset 164 padding to 176
+    float    lightViewX;        // offset 176 light position in view space (shadow pass)
+    float    lightViewY;        // offset 180
+    float    lightViewZ;        // offset 184
+    float    shadowConeRadius;  // offset 188 half-angle (rad) of sun disk for soft-shadow jitter
 };
-static_assert(sizeof(GpuCamera) == 176);
+static_assert(sizeof(GpuCamera) == 192);
 
 // ---------------------------------------------------------------------------
 // CPU-side 4×4 matrix math
@@ -1079,6 +1083,14 @@ static WGPUBuffer create_buffer(WGPUDevice device, uint64_t size, WGPUBufferUsag
 // ---------------------------------------------------------------------------
 
 AoPass::~AoPass() {
+    if (m_shadowDummyNodeBuf) wgpuBufferRelease(m_shadowDummyNodeBuf);
+    if (m_shadowDummyTriBuf)  wgpuBufferRelease(m_shadowDummyTriBuf);
+    if (m_shadowBindGroup)    wgpuBindGroupRelease(m_shadowBindGroup);
+    if (m_shadowBgl)          wgpuBindGroupLayoutRelease(m_shadowBgl);
+    if (m_shadowCamUbo)       wgpuBufferRelease(m_shadowCamUbo);
+    if (m_shadowPipeline)     wgpuComputePipelineRelease(m_shadowPipeline);
+    if (m_shadowView)         wgpuTextureViewRelease(m_shadowView);
+    if (m_shadowTex)          wgpuTextureRelease(m_shadowTex);
     if (m_dynDummyNodeBuf) wgpuBufferRelease(m_dynDummyNodeBuf);
     if (m_dynDummyTriBuf)  wgpuBufferRelease(m_dynDummyTriBuf);
     if (m_tlasBindGroup)  wgpuBindGroupRelease(m_tlasBindGroup);
@@ -1257,6 +1269,495 @@ void AoPass::ensure_tlas_pipeline(WGPUDevice device) {
     wgpuShaderModuleRelease(sm);
 }
 
+// ---------------------------------------------------------------------------
+// Shadow pass shader and pipeline
+// ---------------------------------------------------------------------------
+
+static std::string build_shadow_shader() {
+    return R"(
+// ---- Structs (must match CPU-side layouts) ----------------------------------
+
+struct AcNode {
+    bounds_min : vec3<f32>,
+    hit_next   : u32,
+    bounds_max : vec3<f32>,
+    miss_next  : u32,
+    tri_offset : u32,
+    tri_count  : u32,
+    _pad0      : u32,
+    _pad1      : u32,
+}
+
+struct TlasInstance {
+    pnMtxInv_r0     : vec4<f32>,
+    pnMtxInv_r1     : vec4<f32>,
+    pnMtxInv_r2     : vec4<f32>,
+    blas_node_offset: u32,
+    blas_tri_offset : u32,
+    blas_node_count : u32,
+    blas_tri_count  : u32,
+}
+
+struct BlasTri {
+    v0 : vec4<f32>,
+    v1 : vec4<f32>,
+    v2 : vec4<f32>,
+}
+
+// Camera UBO: 192 bytes, matches GpuCamera on the CPU.
+struct Camera {
+    inv_view_proj  : mat4x4<f32>,  // offset 0
+    screen_width   : u32,          // offset 64
+    screen_height  : u32,          // offset 68
+    rays_per_pixel : u32,          // offset 72
+    frame_seed     : u32,          // offset 76
+    max_distance   : f32,          // offset 80
+    normal_bias    : f32,          // offset 84
+    debug_mode     : u32,          // offset 88
+    debug_mode2    : u32,          // offset 92
+    cam_world_x    : f32,          // offset 96
+    cam_world_y    : f32,          // offset 100
+    cam_world_z    : f32,          // offset 104
+    _pad2          : u32,          // offset 108
+    vtw_r0         : vec4<f32>,    // offset 112
+    vtw_r1         : vec4<f32>,    // offset 128
+    vtw_r2         : vec4<f32>,    // offset 144
+    dyn_node_count : u32,          // offset 160
+    _pad3a         : u32,          // offset 164
+    _pad3b         : u32,          // offset 168
+    _pad3c         : u32,          // offset 172
+    light_view_x        : f32,  // offset 176  light position in view space
+    light_view_y        : f32,  // offset 180
+    light_view_z        : f32,  // offset 184
+    shadow_cone_radius  : f32,  // offset 188  half-angle (rad) of sun disk for soft shadows
+}
+
+struct LbvhNode {
+    bounds_min  : vec3<f32>,
+    left_child  : u32,
+    bounds_max  : vec3<f32>,
+    right_child : u32,
+    tri_offset  : u32,
+    tri_count   : u32,
+    _pad0       : u32,
+    _pad1       : u32,
+}
+
+struct DynBlasTri {
+    a    : vec3<f32>,
+    _p0  : f32,
+    b    : vec3<f32>,
+    _p1  : f32,
+    c    : vec3<f32>,
+    _p2  : f32,
+    _u0  : vec4<f32>,
+    _u1  : vec4<f32>,
+}
+
+// ---- Bindings ---------------------------------------------------------------
+@group(0) @binding(0) var<storage, read> tlas_nodes     : array<AcNode>;
+@group(0) @binding(1) var<storage, read> tlas_instances : array<TlasInstance>;
+@group(0) @binding(2) var<uniform>       cam            : Camera;
+@group(0) @binding(3) var               t_depth        : texture_depth_2d;
+@group(0) @binding(4) var               shadow_out     : texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(5) var<storage, read> blas_nodes     : array<AcNode>;
+@group(0) @binding(6) var<storage, read> blas_tris      : array<BlasTri>;
+@group(0) @binding(7) var<storage, read> dyn_blas_nodes : array<LbvhNode>;
+@group(0) @binding(8) var<storage, read> dyn_blas_tris  : array<DynBlasTri>;
+
+// ---- View→world and local-space transforms ----------------------------------
+fn xf_vtw_point(p: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(dot(cam.vtw_r0, vec4<f32>(p, 1.0)),
+                     dot(cam.vtw_r1, vec4<f32>(p, 1.0)),
+                     dot(cam.vtw_r2, vec4<f32>(p, 1.0)));
+}
+fn xf_vtw_dir(d: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(dot(cam.vtw_r0.xyz, d),
+                     dot(cam.vtw_r1.xyz, d),
+                     dot(cam.vtw_r2.xyz, d));
+}
+fn xf_point(inst: TlasInstance, p: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(dot(inst.pnMtxInv_r0, vec4<f32>(p, 1.0)),
+                     dot(inst.pnMtxInv_r1, vec4<f32>(p, 1.0)),
+                     dot(inst.pnMtxInv_r2, vec4<f32>(p, 1.0)));
+}
+fn xf_dir(inst: TlasInstance, d: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(dot(inst.pnMtxInv_r0.xyz, d),
+                     dot(inst.pnMtxInv_r1.xyz, d),
+                     dot(inst.pnMtxInv_r2.xyz, d));
+}
+
+// ---- AABB slab tests --------------------------------------------------------
+fn aabb_hit(node: AcNode, origin: vec3<f32>, inv_dir: vec3<f32>, tmax: f32) -> bool {
+    let t1 = (node.bounds_min - origin) * inv_dir;
+    let t2 = (node.bounds_max - origin) * inv_dir;
+    let tmin_v = min(t1, t2); let tmax_v = max(t1, t2);
+    let tmin_s = max(max(tmin_v.x, tmin_v.y), max(tmin_v.z, 0.0));
+    let tmax_s = min(min(tmax_v.x, tmax_v.y), min(tmax_v.z, tmax));
+    return tmin_s <= tmax_s;
+}
+fn aabb_hit_lbvh(node: LbvhNode, origin: vec3<f32>, inv_dir: vec3<f32>, tmax: f32) -> bool {
+    let t1 = (node.bounds_min - origin) * inv_dir;
+    let t2 = (node.bounds_max - origin) * inv_dir;
+    let tmin_v = min(t1, t2); let tmax_v = max(t1, t2);
+    let tmin_s = max(max(tmin_v.x, tmin_v.y), max(tmin_v.z, 0.0));
+    let tmax_s = min(min(tmax_v.x, tmax_v.y), min(tmax_v.z, tmax));
+    return tmin_s <= tmax_s;
+}
+
+// ---- Triangle intersection --------------------------------------------------
+fn blas_ray_tri_hit(origin: vec3<f32>, dir: vec3<f32>, tri: BlasTri, tmax: f32) -> bool {
+    let e1 = tri.v1.xyz - tri.v0.xyz; let e2 = tri.v2.xyz - tri.v0.xyz;
+    let h = cross(dir, e2); let det = dot(e1, h);
+    if (abs(det) < 1e-7) { return false; }
+    let inv_det = 1.0 / det;
+    let sv = origin - tri.v0.xyz;
+    let u = dot(sv, h) * inv_det;
+    if (u < 0.0 || u > 1.0) { return false; }
+    let q = cross(sv, e1);
+    let v = dot(dir, q) * inv_det;
+    if (v < 0.0 || u + v > 1.0) { return false; }
+    let t = dot(e2, q) * inv_det;
+    return (t > 1e-4 && t < tmax);
+}
+fn dyn_ray_tri_hit(origin: vec3<f32>, dir: vec3<f32>, tri: DynBlasTri, tmax: f32) -> bool {
+    let e1 = tri.b - tri.a; let e2 = tri.c - tri.a;
+    let h = cross(dir, e2); let det = dot(e1, h);
+    if (abs(det) < 1e-7) { return false; }
+    let inv_det = 1.0 / det;
+    let sv = origin - tri.a;
+    let u = dot(sv, h) * inv_det;
+    if (u < 0.0 || u > 1.0) { return false; }
+    let q = cross(sv, e1);
+    let v = dot(dir, q) * inv_det;
+    if (v < 0.0 || u + v > 1.0) { return false; }
+    let t = dot(e2, q) * inv_det;
+    return (t > 1e-4 && t < tmax);
+}
+
+// ---- BVH traversal ----------------------------------------------------------
+const kMaxTlasVisits: u32 = 1024u;
+const kMaxBlasVisits: u32 = 2048u;
+
+fn traverse_blas(inst: TlasInstance, l_origin: vec3<f32>, l_dir: vec3<f32>,
+                 tmax: f32, heat_acc: ptr<function, u32>) -> u32 {
+    let inv_dir = vec3<f32>(1.0/l_dir.x, 1.0/l_dir.y, 1.0/l_dir.z);
+    var idx: u32 = inst.blas_node_offset;
+    var local_v: u32 = 0u;
+    loop {
+        if (idx == 0xFFFFFFFFu) { break; }
+        if (local_v >= kMaxBlasVisits) { *heat_acc += local_v; return 2u; }
+        local_v += 1u;
+        let node = blas_nodes[idx];
+        if (!aabb_hit(node, l_origin, inv_dir, tmax)) { idx = node.miss_next; continue; }
+        if (node.tri_count > 0u) {
+            for (var i = node.tri_offset; i < node.tri_offset + node.tri_count; i += 1u) {
+                if (blas_ray_tri_hit(l_origin, l_dir, blas_tris[i], tmax)) {
+                    *heat_acc += local_v; return 1u;
+                }
+            }
+            idx = node.miss_next;
+        } else { idx = node.hit_next; }
+    }
+    *heat_acc += local_v;
+    return 0u;
+}
+
+fn traverse_dyn_lbvh(origin: vec3<f32>, dir: vec3<f32>, tmax: f32,
+                      heat_acc: ptr<function, u32>) -> u32 {
+    if (cam.dyn_node_count == 0u) { return 0u; }
+    let inv_dir = vec3<f32>(1.0/dir.x, 1.0/dir.y, 1.0/dir.z);
+    var stk: array<u32, 64>;
+    var sp: i32 = 1; stk[0] = 0u;
+    var visits: u32 = 0u;
+    loop {
+        if (sp <= 0 || visits >= kMaxBlasVisits) { break; }
+        sp -= 1; visits += 1u;
+        let idx  = stk[u32(sp)];
+        let node = dyn_blas_nodes[idx];
+        if (!aabb_hit_lbvh(node, origin, inv_dir, tmax)) { continue; }
+        if (node.tri_count > 0u) {
+            for (var i = node.tri_offset; i < node.tri_offset + node.tri_count; i += 1u) {
+                if (dyn_ray_tri_hit(origin, dir, dyn_blas_tris[i], tmax)) {
+                    *heat_acc += visits; return 1u;
+                }
+            }
+        } else {
+            if (sp < 62) {
+                stk[u32(sp)] = node.right_child; sp += 1;
+                stk[u32(sp)] = node.left_child;  sp += 1;
+            }
+        }
+    }
+    *heat_acc += visits;
+    return select(0u, 2u, visits >= kMaxBlasVisits);
+}
+
+fn intersects_any(origin_view: vec3<f32>, dir_view: vec3<f32>, tmax: f32,
+                  acc_visits: ptr<function, u32>) -> u32 {
+    if (arrayLength(&tlas_nodes) > 0u && arrayLength(&tlas_instances) > 0u) {
+        let origin  = xf_vtw_point(origin_view);
+        let dir     = xf_vtw_dir(dir_view);
+        let inv_dir = vec3<f32>(1.0/dir.x, 1.0/dir.y, 1.0/dir.z);
+        var idx: u32 = 0u; var tlas_v: u32 = 0u;
+        loop {
+            if (idx == 0xFFFFFFFFu) { break; }
+            if (tlas_v >= kMaxTlasVisits) { *acc_visits += tlas_v; return 2u; }
+            tlas_v += 1u;
+            let node = tlas_nodes[idx];
+            if (!aabb_hit(node, origin, inv_dir, tmax)) { idx = node.miss_next; continue; }
+            if (node.tri_count == 1u) {
+                let inst     = tlas_instances[node.tri_offset];
+                let l_origin = xf_point(inst, origin_view);
+                let l_dir    = xf_dir(inst, dir_view);
+                let r = traverse_blas(inst, l_origin, l_dir, tmax, acc_visits);
+                if (r == 1u) { *acc_visits += tlas_v; return 1u; }
+                if (r == 2u) { *acc_visits += tlas_v; return 2u; }
+                idx = node.miss_next;
+            } else { idx = node.hit_next; }
+        }
+        *acc_visits += tlas_v;
+    }
+    return traverse_dyn_lbvh(origin_view, dir_view, tmax, acc_visits);
+}
+
+// ---- Depth unproject and normal estimation ----------------------------------
+fn load_depth(px: u32, py: u32) -> f32 { return -textureLoad(t_depth, vec2<i32>(i32(px), i32(py)), 0); }
+
+fn unproject(px: u32, py: u32) -> vec4<f32> {
+    let d = load_depth(px, py);
+    let ndc_x = (f32(px) + 0.5) / f32(cam.screen_width)  *  2.0 - 1.0;
+    let ndc_y = (f32(py) + 0.5) / f32(cam.screen_height) * -2.0 + 1.0;
+    let ndc_h = vec4<f32>(ndc_x, ndc_y, d, 1.0);
+    let world_h = ndc_h * cam.inv_view_proj;
+    if (abs(world_h.w) < 1e-6) { return vec4<f32>(0.0, 0.0, 0.0, 0.0); }
+    return vec4<f32>(world_h.xyz / world_h.w, 1.0);
+}
+
+fn estimate_normal(px: u32, py: u32, pos: vec3<f32>) -> vec3<f32> {
+    let W = cam.screen_width; let H = cam.screen_height;
+    let d0 = length(pos); let thresh = max(d0 * 0.15, 0.1);
+    let xp = unproject(select(px + 1u, px - 1u, px + 1u >= W), py);
+    let xn = unproject(select(px - 1u, px + 1u, px == 0u),     py);
+    let yp = unproject(px, select(py + 1u, py - 1u, py + 1u >= H));
+    let yn = unproject(px, select(py - 1u, py + 1u, py == 0u));
+    let xp_ok = xp.w > 0.5 && abs(length(xp.xyz) - d0) < thresh && (px + 1u < W);
+    let xn_ok = xn.w > 0.5 && abs(length(xn.xyz) - d0) < thresh && (px > 0u);
+    let yp_ok = yp.w > 0.5 && abs(length(yp.xyz) - d0) < thresh && (py + 1u < H);
+    let yn_ok = yn.w > 0.5 && abs(length(yn.xyz) - d0) < thresh && (py > 0u);
+    var tx: vec3<f32>;
+    if      (xp_ok) { tx = xp.xyz - pos; }
+    else if (xn_ok) { tx = pos - xn.xyz; }
+    else            { return normalize(-pos); }
+    var ty: vec3<f32>;
+    if      (yp_ok) { ty = yp.xyz - pos; }
+    else if (yn_ok) { ty = pos - yn.xyz; }
+    else            { return normalize(-pos); }
+    let n = cross(tx, ty); let nl = length(n);
+    if (nl < 1e-6) { return normalize(-pos); }
+    var nn = n / nl;
+    if (dot(nn, normalize(-pos)) < 0.0) { nn = -nn; }
+    return nn;
+}
+
+// ---- PCG random number generator (same as AO shader) -----------------------
+fn pcg(v_in: u32) -> u32 {
+    var v = v_in * 747796405u + 2891336453u;
+    v = ((v >> ((v >> 28u) + 4u)) ^ v) * 277803737u;
+    return (v >> 22u) ^ v;
+}
+fn rand_f(seed: ptr<function, u32>) -> f32 {
+    *seed = pcg(*seed);
+    return f32(*seed) / 4294967296.0;
+}
+
+// ---- Shadow main ------------------------------------------------------------
+// Half-resolution dispatch: one 2×2 block per thread.
+// Soft shadows: cast cam.rays_per_pixel rays uniformly distributed within a
+// cone of half-angle cam.shadow_cone_radius around the exact sun direction.
+// The fraction of rays that hit nothing gives a smooth 0→1 penumbra.
+@compute @workgroup_size(8, 8)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let px = gid.x * 2u;
+    let py = gid.y * 2u;
+    if (px >= cam.screen_width || py >= cam.screen_height) { return; }
+
+    let W = i32(cam.screen_width);
+    let H = i32(cam.screen_height);
+    let c00 = vec2<i32>(i32(px),     i32(py));
+    let c10 = vec2<i32>(i32(px) + 1, i32(py));
+    let c01 = vec2<i32>(i32(px),     i32(py) + 1);
+    let c11 = vec2<i32>(i32(px) + 1, i32(py) + 1);
+
+    // Sky pixel — always fully lit
+    let d = textureLoad(t_depth, vec2<i32>(i32(px), i32(py)), 0);
+    if (d <= 0.0001) {
+        let lit = vec4<f32>(1.0, 1.0, 1.0, 1.0);
+        textureStore(shadow_out, c00, lit); textureStore(shadow_out, c10, lit);
+        textureStore(shadow_out, c01, lit); textureStore(shadow_out, c11, lit);
+        return;
+    }
+
+    // Reconstruct view-space surface position
+    let pos_h = unproject(px, py);
+    if (pos_h.w < 0.5) {
+        let lit = vec4<f32>(1.0, 1.0, 1.0, 1.0);
+        textureStore(shadow_out, c00, lit); textureStore(shadow_out, c10, lit);
+        textureStore(shadow_out, c01, lit); textureStore(shadow_out, c11, lit);
+        return;
+    }
+    let pos    = pos_h.xyz;
+    let normal = estimate_normal(px, py, pos);
+
+    // Shadow ray: from surface toward light (both in view space)
+    let light_view = vec3<f32>(cam.light_view_x, cam.light_view_y, cam.light_view_z);
+    let to_light   = light_view - pos;
+    let light_dist = length(to_light);
+    if (light_dist < 1e-4) {
+        let lit = vec4<f32>(1.0, 1.0, 1.0, 1.0);
+        textureStore(shadow_out, c00, lit); textureStore(shadow_out, c10, lit);
+        textureStore(shadow_out, c01, lit); textureStore(shadow_out, c11, lit);
+        return;
+    }
+    let ray_dir    = to_light / light_dist;
+    let dist_cam   = length(pos);
+    let ray_origin = pos + normal * max(dist_cam * cam.normal_bias, cam.normal_bias * 10.0);
+
+    // Backlit surface: normal faces away from the light — in shadow by definition.
+    let cos_theta = dot(normal, ray_dir);
+    if (cos_theta <= 0.0) {
+        let shadow = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        textureStore(shadow_out, c00, shadow); textureStore(shadow_out, c10, shadow);
+        textureStore(shadow_out, c01, shadow); textureStore(shadow_out, c11, shadow);
+        return;
+    }
+
+    // Cap tmax: prevents distant skybox geometry in the TLAS from blocking every ray.
+    let tmax = select(light_dist, min(light_dist, cam.max_distance), cam.max_distance > 0.0);
+
+    // Build an orthonormal tangent frame around ray_dir for sun-disk jitter.
+    var up = vec3<f32>(0.0, 1.0, 0.0);
+    if (abs(ray_dir.y) > 0.99) { up = vec3<f32>(1.0, 0.0, 0.0); }
+    let tangent   = normalize(cross(up, ray_dir));
+    let bitangent = cross(ray_dir, tangent);
+
+    // Per-pixel RNG seed: mix pixel index with frame seed so samples change each frame.
+    var seed = pcg(((py * cam.screen_width + px) * 1664525u) ^ cam.frame_seed);
+    let N    = max(1u, cam.rays_per_pixel);
+    var lit_count = 0u;
+    for (var i = 0u; i < N; i += 1u) {
+        // Uniform disk sample within the sun's angular radius (in steradians = cone).
+        let r1 = rand_f(&seed);
+        let r2 = rand_f(&seed);
+        let disk_r   = cam.shadow_cone_radius * sqrt(r1);
+        let disk_phi = 6.2831853 * r2;
+        let jittered_dir = normalize(ray_dir + disk_r * (cos(disk_phi) * tangent + sin(disk_phi) * bitangent));
+        var v = 0u;
+        let r = intersects_any(ray_origin, jittered_dir, tmax, &v);
+        if (r != 1u) { lit_count += 1u; }  // miss (0) or visit-limit (2) → treat as lit
+    }
+    let shadow_val = f32(lit_count) / f32(N);
+
+    let out = vec4<f32>(shadow_val, shadow_val, shadow_val, 1.0);
+    textureStore(shadow_out, c00, out);
+    if (c10.x < W) { textureStore(shadow_out, c10, out); }
+    if (c01.y < H) { textureStore(shadow_out, c01, out); }
+    if (c10.x < W && c01.y < H) { textureStore(shadow_out, c11, out); }
+}
+)";
+}
+
+void AoPass::ensure_shadow_pipeline(WGPUDevice device) {
+    if (m_shadowPipeline) return;
+
+    const std::string src = build_shadow_shader();
+    WGPUShaderSourceWGSL wgslSrc{};
+    wgslSrc.chain.sType = WGPUSType_ShaderSourceWGSL;
+    wgslSrc.code        = {src.c_str(), WGPU_STRLEN};
+    WGPUShaderModuleDescriptor smDesc{};
+    smDesc.nextInChain = &wgslSrc.chain;
+    WGPUShaderModule sm = wgpuDeviceCreateShaderModule(device, &smDesc);
+
+    // 9 bindings: TLAS nodes/instances, Camera, depth, shadow_out, BLAS nodes/tris, dyn LBVH nodes/tris
+    WGPUBindGroupLayoutEntry entries[9] = {};
+    entries[0].binding = 0; entries[0].visibility = WGPUShaderStage_Compute;
+    entries[0].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
+    entries[1].binding = 1; entries[1].visibility = WGPUShaderStage_Compute;
+    entries[1].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
+    entries[2].binding = 2; entries[2].visibility = WGPUShaderStage_Compute;
+    entries[2].buffer.type = WGPUBufferBindingType_Uniform;
+    entries[3].binding = 3; entries[3].visibility = WGPUShaderStage_Compute;
+    entries[3].texture.sampleType    = WGPUTextureSampleType_Depth;
+    entries[3].texture.viewDimension = WGPUTextureViewDimension_2D;
+    entries[4].binding = 4; entries[4].visibility = WGPUShaderStage_Compute;
+    entries[4].storageTexture.access        = WGPUStorageTextureAccess_WriteOnly;
+    entries[4].storageTexture.format        = WGPUTextureFormat_RGBA8Unorm;
+    entries[4].storageTexture.viewDimension = WGPUTextureViewDimension_2D;
+    entries[5].binding = 5; entries[5].visibility = WGPUShaderStage_Compute;
+    entries[5].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
+    entries[6].binding = 6; entries[6].visibility = WGPUShaderStage_Compute;
+    entries[6].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
+    entries[7].binding = 7; entries[7].visibility = WGPUShaderStage_Compute;
+    entries[7].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
+    entries[8].binding = 8; entries[8].visibility = WGPUShaderStage_Compute;
+    entries[8].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
+
+    WGPUBindGroupLayoutDescriptor bglDesc{};
+    bglDesc.entryCount = 9;
+    bglDesc.entries    = entries;
+    m_shadowBgl = wgpuDeviceCreateBindGroupLayout(device, &bglDesc);
+
+    WGPUPipelineLayoutDescriptor plDesc{};
+    plDesc.bindGroupLayoutCount = 1;
+    plDesc.bindGroupLayouts     = &m_shadowBgl;
+    WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(device, &plDesc);
+
+    WGPUComputePipelineDescriptor cpDesc{};
+    cpDesc.layout             = pl;
+    cpDesc.compute.module     = sm;
+    cpDesc.compute.entryPoint = {"cs_main", WGPU_STRLEN};
+    m_shadowPipeline = wgpuDeviceCreateComputePipeline(device, &cpDesc);
+
+    wgpuPipelineLayoutRelease(pl);
+    wgpuShaderModuleRelease(sm);
+}
+
+void AoPass::rebuild_shadow_bind_group(WGPUDevice device) {
+    if (m_shadowBindGroup) { wgpuBindGroupRelease(m_shadowBindGroup); m_shadowBindGroup = nullptr; }
+
+    if (!m_shadowDummyNodeBuf) {
+        WGPUBufferDescriptor d{}; d.size = 4;
+        d.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
+        m_shadowDummyNodeBuf = wgpuDeviceCreateBuffer(device, &d);
+    }
+    if (!m_shadowDummyTriBuf) {
+        WGPUBufferDescriptor d{}; d.size = 4;
+        d.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
+        m_shadowDummyTriBuf = wgpuDeviceCreateBuffer(device, &d);
+    }
+
+    WGPUBuffer dynNodeBuf = m_shadowLastDynNodeBuf ? m_shadowLastDynNodeBuf : m_shadowDummyNodeBuf;
+    WGPUBuffer dynTriBuf  = m_shadowLastDynTriBuf  ? m_shadowLastDynTriBuf  : m_shadowDummyTriBuf;
+
+    WGPUBindGroupEntry entries[9] = {};
+    entries[0].binding = 0; entries[0].buffer = m_shadowLastNodeBuf;     entries[0].size = WGPU_WHOLE_SIZE;
+    entries[1].binding = 1; entries[1].buffer = m_shadowLastInstBuf;     entries[1].size = WGPU_WHOLE_SIZE;
+    entries[2].binding = 2; entries[2].buffer = m_shadowCamUbo;          entries[2].size = sizeof(GpuCamera);
+    entries[3].binding = 3; entries[3].textureView = m_depthView;
+    entries[4].binding = 4; entries[4].textureView = m_shadowView;
+    entries[5].binding = 5; entries[5].buffer = m_shadowLastBlasNodeBuf; entries[5].size = WGPU_WHOLE_SIZE;
+    entries[6].binding = 6; entries[6].buffer = m_shadowLastBlasTriBuf;  entries[6].size = WGPU_WHOLE_SIZE;
+    entries[7].binding = 7; entries[7].buffer = dynNodeBuf;              entries[7].size = WGPU_WHOLE_SIZE;
+    entries[8].binding = 8; entries[8].buffer = dynTriBuf;               entries[8].size = WGPU_WHOLE_SIZE;
+
+    WGPUBindGroupDescriptor bgd{};
+    bgd.layout     = m_shadowBgl;
+    bgd.entryCount = 9;
+    bgd.entries    = entries;
+    m_shadowBindGroup      = wgpuDeviceCreateBindGroup(device, &bgd);
+    m_shadowBindGroupDirty = false;
+}
+
 void AoPass::rebuild_tlas_bind_group(WGPUDevice device) {
     if (m_tlasBindGroup) { wgpuBindGroupRelease(m_tlasBindGroup); m_tlasBindGroup = nullptr; }
 
@@ -1305,10 +1806,12 @@ void AoPass::rebuild_tlas_bind_group(WGPUDevice device) {
 }
 
 void AoPass::rebuild_output(WGPUDevice device, uint32_t w, uint32_t h) {
-    if (m_aoView)  { wgpuTextureViewRelease(m_aoView);  m_aoView  = nullptr; }
-    if (m_aoTex)   { wgpuTextureRelease(m_aoTex);       m_aoTex   = nullptr; }
-    if (m_limView) { wgpuTextureViewRelease(m_limView); m_limView = nullptr; }
-    if (m_limTex)  { wgpuTextureRelease(m_limTex);      m_limTex  = nullptr; }
+    if (m_aoView)     { wgpuTextureViewRelease(m_aoView);     m_aoView     = nullptr; }
+    if (m_aoTex)      { wgpuTextureRelease(m_aoTex);          m_aoTex      = nullptr; }
+    if (m_limView)    { wgpuTextureViewRelease(m_limView);    m_limView    = nullptr; }
+    if (m_limTex)     { wgpuTextureRelease(m_limTex);         m_limTex     = nullptr; }
+    if (m_shadowView) { wgpuTextureViewRelease(m_shadowView); m_shadowView = nullptr; }
+    if (m_shadowTex)  { wgpuTextureRelease(m_shadowTex);      m_shadowTex  = nullptr; }
 
     WGPUTextureDescriptor td{};
     td.usage         = WGPUTextureUsage_StorageBinding | WGPUTextureUsage_TextureBinding;
@@ -1317,14 +1820,19 @@ void AoPass::rebuild_output(WGPUDevice device, uint32_t w, uint32_t h) {
     td.format        = WGPUTextureFormat_RGBA8Unorm;
     td.mipLevelCount = 1;
     td.sampleCount   = 1;
-    m_aoTex  = wgpuDeviceCreateTexture(device, &td);
-    m_aoView = wgpuTextureCreateView(m_aoTex, nullptr);
-    m_limTex  = wgpuDeviceCreateTexture(device, &td);
-    m_limView = wgpuTextureCreateView(m_limTex, nullptr);
+    m_aoTex    = wgpuDeviceCreateTexture(device, &td);
+    m_aoView   = wgpuTextureCreateView(m_aoTex, nullptr);
+    m_limTex   = wgpuDeviceCreateTexture(device, &td);
+    m_limView  = wgpuTextureCreateView(m_limTex, nullptr);
+    m_shadowTex  = wgpuDeviceCreateTexture(device, &td);
+    m_shadowView = wgpuTextureCreateView(m_shadowTex, nullptr);
 
     m_width  = w;
     m_height = h;
-    m_bindGroupDirty = true;
+    m_bindGroupDirty     = true;
+    m_tlasBindGroupDirty = true;
+    m_shadowBindGroupDirty = true;
+    m_shadowReady = false;  // new texture; next dispatch will re-populate it
 }
 
 void AoPass::rebuild_depth_binding(WGPUDevice device, WGPUTexture depthTex) {
@@ -1340,8 +1848,9 @@ void AoPass::rebuild_depth_binding(WGPUDevice device, WGPUTexture depthTex) {
     dvd.aspect          = WGPUTextureAspect_DepthOnly;
     m_depthView    = wgpuTextureCreateView(depthTex, &dvd);
     m_lastDepthTex = depthTex;
-    m_bindGroupDirty     = true;
-    m_tlasBindGroupDirty = true;
+    m_bindGroupDirty       = true;
+    m_tlasBindGroupDirty   = true;
+    m_shadowBindGroupDirty = true;
 }
 
 void AoPass::rebuild_bind_group(WGPUDevice device) {
@@ -1589,5 +2098,87 @@ void AoPass::execute_tlas(WGPUDevice device, WGPUCommandEncoder encoder,
 
 ImTextureID AoPass::imgui_texture_id()    const { return reinterpret_cast<ImTextureID>(m_aoView);  }
 ImTextureID AoPass::limits_texture_id()  const { return reinterpret_cast<ImTextureID>(m_limView); }
+
+void AoPass::execute_shadow_tlas(WGPUDevice device, WGPUCommandEncoder encoder,
+                                  WGPUTexture depthTex,
+                                  const GeometryCollector::CameraData& cam,
+                                  WGPUBuffer tlasNodeBuf, WGPUBuffer instanceBuf,
+                                  WGPUBuffer blasNodeBuf, WGPUBuffer blasTriBuf,
+                                  WGPUBuffer dynNodeBuf, WGPUBuffer dynTriBuf, uint32_t dynNodeCount) {
+    if (!cam.valid || !depthTex) return;
+    if (!tlasNodeBuf || !instanceBuf || !blasNodeBuf || !blasTriBuf) return;
+
+    if (tlasNodeBuf != m_shadowLastNodeBuf || instanceBuf != m_shadowLastInstBuf ||
+        blasNodeBuf != m_shadowLastBlasNodeBuf || blasTriBuf != m_shadowLastBlasTriBuf ||
+        dynNodeBuf  != m_shadowLastDynNodeBuf  || dynTriBuf  != m_shadowLastDynTriBuf) {
+        m_shadowLastNodeBuf     = tlasNodeBuf;
+        m_shadowLastInstBuf     = instanceBuf;
+        m_shadowLastBlasNodeBuf = blasNodeBuf;
+        m_shadowLastBlasTriBuf  = blasTriBuf;
+        m_shadowLastDynNodeBuf  = dynNodeBuf;
+        m_shadowLastDynTriBuf   = dynTriBuf;
+        m_shadowBindGroupDirty  = true;
+    }
+
+    const uint32_t w = wgpuTextureGetWidth(depthTex);
+    const uint32_t h = wgpuTextureGetHeight(depthTex);
+    if (w == 0 || h == 0) return;
+
+    ensure_shadow_pipeline(device);
+    if (!m_shadowPipeline) return;
+
+    if (w != m_width || h != m_height) rebuild_output(device, w, h);
+    if (depthTex != m_lastDepthTex)    rebuild_depth_binding(device, depthTex);
+
+    // Build the shadow camera UBO: same as AO UBO plus view-space light position.
+    GpuCamera gpuCam{};
+    gpuCam.screenWidth      = w;
+    gpuCam.screenHeight     = h;
+    gpuCam.raysPerPixel     = m_params.raysPerPixel;
+    gpuCam.frameSeed        = m_frame++;
+    gpuCam.normalBias       = m_params.normalBias;
+    gpuCam.maxDistance      = m_params.maxDistance;  // caps tmax to avoid skybox hits
+    gpuCam.shadowConeRadius = m_params.shadowConeRadius;
+    gpuCam.dynNodeCount     = dynNodeCount;
+    if (!compute_inv_proj(cam, gpuCam.invViewProj)) return;
+    gpuCam.viewToWorld[0]=1; gpuCam.viewToWorld[1]=0; gpuCam.viewToWorld[2]=0;  gpuCam.viewToWorld[3]=0;
+    gpuCam.viewToWorld[4]=0; gpuCam.viewToWorld[5]=1; gpuCam.viewToWorld[6]=0;  gpuCam.viewToWorld[7]=0;
+    gpuCam.viewToWorld[8]=0; gpuCam.viewToWorld[9]=0; gpuCam.viewToWorld[10]=1; gpuCam.viewToWorld[11]=0;
+    compute_view_to_world(cam, gpuCam.viewToWorld);
+
+    // Transform light from world space to view space using the view matrix.
+    const float* lw = cam.lightWorldPos;
+    const float(&V)[4][4] = cam.view;
+    gpuCam.lightViewX = V[0][0]*lw[0] + V[0][1]*lw[1] + V[0][2]*lw[2] + V[0][3];
+    gpuCam.lightViewY = V[1][0]*lw[0] + V[1][1]*lw[1] + V[1][2]*lw[2] + V[1][3];
+    gpuCam.lightViewZ = V[2][0]*lw[0] + V[2][1]*lw[1] + V[2][2]*lw[2] + V[2][3];
+    m_lastLightViewPos[0] = gpuCam.lightViewX;
+    m_lastLightViewPos[1] = gpuCam.lightViewY;
+    m_lastLightViewPos[2] = gpuCam.lightViewZ;
+
+    if (!m_shadowCamUbo) {
+        m_shadowCamUbo = create_buffer(device, sizeof(GpuCamera), WGPUBufferUsage_Uniform);
+        m_shadowBindGroupDirty = true;
+    }
+
+    WGPUQueue q = wgpuDeviceGetQueue(device);
+    wgpuQueueWriteBuffer(q, m_shadowCamUbo, 0, &gpuCam, sizeof(GpuCamera));
+    wgpuQueueRelease(q);
+
+    if (m_shadowBindGroupDirty) rebuild_shadow_bind_group(device);
+
+    WGPUComputePassDescriptor passDesc{};
+    WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(encoder, &passDesc);
+    wgpuComputePassEncoderSetPipeline(pass, m_shadowPipeline);
+    wgpuComputePassEncoderSetBindGroup(pass, 0, m_shadowBindGroup, 0, nullptr);
+    const uint32_t gx = (w / 2 + 7) / 8;
+    const uint32_t gy = (h / 2 + 7) / 8;
+    wgpuComputePassEncoderDispatchWorkgroups(pass, gx, gy, 1);
+    wgpuComputePassEncoderEnd(pass);
+    wgpuComputePassEncoderRelease(pass);
+    m_shadowReady = true;
+}
+
+ImTextureID AoPass::shadow_imgui_texture_id() const { return reinterpret_cast<ImTextureID>(m_shadowView); }
 
 } // namespace dusk::rtao

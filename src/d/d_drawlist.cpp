@@ -22,6 +22,7 @@
 #include "dusk/frame_interpolation.h"
 #include "dusk/gx_helper.h"
 #include "dusk/logging.h"
+#include "dusk/settings.h"
 
 static const void* getInterpKey(const void* base, int idx) {
     return reinterpret_cast<const void*>(reinterpret_cast<uintptr_t>(base) ^ idx);
@@ -1202,6 +1203,12 @@ static BOOL realPolygonCheck(cXyz* param_0, f32 param_1, f32 param_2, cXyz* para
 }
 
 static void setkankyoShadow(dKy_tevstr_c* param_0, f32* param_1) {
+#if TARGET_PC
+    if (dusk::getSettings().game.rtShadowEnabled.getValue()) {
+        *param_1 = 0.0f;
+        return;
+    }
+#endif
     dScnKy_env_light_c* env_light = dKy_getEnvlight();
 
     if (param_0 != NULL) {

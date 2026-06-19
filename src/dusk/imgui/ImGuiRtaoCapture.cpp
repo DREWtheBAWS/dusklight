@@ -1,6 +1,7 @@
 #include "ImGuiMenuTools.hpp"
 #include "imgui.h"
 #include "misc/cpp/imgui_stdlib.h"
+#include "d/d_kankyo.h"
 #include <SDL3/SDL_filesystem.h>
 #include <array>
 #include <cmath>
@@ -146,6 +147,13 @@ void ImGuiMenuTools::ShowRtaoCaptureWindow() {
         static bool s_excludeSkinned = false;
         if (ImGui::Checkbox("Exclude skinned (validate static cache)", &s_excludeSkinned))
             m_excludeSkinned = s_excludeSkinned;
+    }
+    {
+        static bool s_forceRebuild = false;
+        if (ImGui::Checkbox("Force full rebuild every frame (disable fast-path cache)", &s_forceRebuild))
+            m_tlasBuilder.set_force_rebuild(s_forceRebuild);
+        if (s_forceRebuild)
+            ImGui::SameLine(), ImGui::TextColored({1.f, 0.8f, 0.2f, 1.f}, "(rebuild forced)");
     }
     const auto tlasStats = m_tlasBuilder.last_stats();
     if (m_tlasBuilder.is_ready()) {
@@ -328,9 +336,11 @@ void ImGuiMenuTools::ShowRtaoCaptureWindow() {
     ImGui::SameLine();
     ImGui::SetNextItemWidth(180.f);
     ImGui::Combo("Right panel", &s_debugMode2, "Limit Hits\0AO\0Normals\0Depth dist\0Root AABB\0Visit Heat\0Limit %\0");
+    static float s_shadowConeRadius = 0.02f;
     m_aoPass.set_params({static_cast<uint32_t>(s_raysPerPixel), s_maxDist, s_normalBias,
                          static_cast<uint32_t>(s_debugMode),
-                         static_cast<uint32_t>(s_debugMode2)});
+                         static_cast<uint32_t>(s_debugMode2),
+                         s_shadowConeRadius});
     // Geometry sphere radius: 4× the AO ray length ensures surfaces at the far end of
     // the frustum still have nearby geometry collected for occlusion.
     // Frustum margin: exactly the AO ray length — geometry more than one ray-length outside
@@ -342,6 +352,7 @@ void ImGuiMenuTools::ShowRtaoCaptureWindow() {
     // coarse terrain patches that inflate every ancestor AABB in the BVH tree
     // without contributing meaningful occlusion detail.
     m_collector.set_max_edge_length(s_maxDist * 3.f);
+    m_blasCache.set_max_distance(s_maxDist * 4.f);
 
     static const char* kPanelNames1[] = {"AO", "Normals", "Depth dist", "Root AABB"};
     static const char* kPanelNames2[] = {"Limit Hits", "AO", "Normals", "Depth dist", "Root AABB", "Visit Heat", "Limit %"};
@@ -467,6 +478,74 @@ void ImGuiMenuTools::ShowRtaoCaptureWindow() {
                             static_cast<uint32_t>(tlasAabbs.size()));
             }
         }
+    }
+
+    // ---- RT Shadows ------------------------------------------------------------
+    ImGui::Separator();
+    ImGui::TextDisabled("RT Shadows");
+
+    ImGui::Checkbox("Shadow enabled", &m_shadowEnabled);
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!m_shadowEnabled);
+    ImGui::SetNextItemWidth(160.f);
+    ImGui::SliderFloat("Strength##shadow", &m_shadowStrength, 0.f, 1.f, "%.2f");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(160.f);
+    // Sun cone radius: half-angle (radians) of the sun disk. Larger = wider, softer penumbra.
+    // 0.01 rad (~0.6 deg) = sharp sun-like shadows; 0.1 rad (~6 deg) = very soft.
+    ImGui::SliderFloat("Sun cone##shadow", &s_shadowConeRadius, 0.0f, 0.3f, "%.3f rad");
+    ImGui::EndDisabled();
+
+    // Light position diagnostics.
+    // sun_light_pos = GX sun light (far-field, correct for shadows).
+    // plight_near_pos = closest point light (torch/lamp — WRONG for sun shadows).
+    {
+        const cXyz& sunLight   = g_env_light.sun_light_pos;
+        const cXyz  nearLight  = dKy_plight_near_pos();
+        ImGui::Text("sun_light_pos:  (%.1f, %.1f, %.1f)", sunLight.x, sunLight.y, sunLight.z);
+        ImGui::Text("plight_near_pos:(%.1f, %.1f, %.1f)  [ignored now]", nearLight.x, nearLight.y, nearLight.z);
+
+        const bool sunIsZero = (sunLight.x == 0.f && sunLight.y == 0.f && sunLight.z == 0.f);
+        if (sunIsZero) {
+            ImGui::TextColored({1.f, 0.4f, 0.f, 1.f},
+                "  ^ WARNING: sun_light_pos is zero (not yet set by dKy_setLight)");
+        }
+
+        const auto cam2 = m_collector.last_camera_data();
+        if (cam2.valid && !sunIsZero) {
+            // Sanity: sun should be far from the scene.  Distance from camera world pos to sun.
+            const float dx = sunLight.x - cam2.worldPos[0];
+            const float dy = sunLight.y - cam2.worldPos[1];
+            const float dz = sunLight.z - cam2.worldPos[2];
+            const float dist = std::sqrt(dx*dx + dy*dy + dz*dz);
+            ImGui::Text("Camera-to-sun dist:  %.1f world units", dist);
+            if (dist < 100.f)
+                ImGui::TextColored({1.f, 0.4f, 0.f, 1.f}, "  ^ sun is very close — may be indoors or uninit");
+        }
+
+        if (m_aoPass.shadow_ready()) {
+            float lv[3];
+            m_aoPass.last_light_view_pos(lv);
+            ImGui::Text("Light view (last):   (%.1f, %.1f, %.1f)", lv[0], lv[1], lv[2]);
+            // tmax used for shadow rays = min(light_dist, max_distance).
+            const float lightViewDist = std::sqrt(lv[0]*lv[0] + lv[1]*lv[1] + lv[2]*lv[2]);
+            ImGui::Text("light_dist (view):   %.1f  |  max_dist cap: %.0f", lightViewDist, s_maxDist);
+        } else {
+            ImGui::TextDisabled("Light view: (no shadow dispatch yet)");
+        }
+    }
+
+    // Shadow texture preview — white pixels = lit, dark = shadowed.
+    // If this is all black, every surface pixel is being classified as occluded.
+    if (m_aoPass.shadow_ready()) {
+        const float avail  = ImGui::GetContentRegionAvail().x;
+        const float aspect = static_cast<float>(m_aoPass.width()) /
+                             static_cast<float>(m_aoPass.height());
+        const float previewH = avail / aspect;
+        ImGui::TextDisabled("Shadow texture (white=lit, black=shadowed):");
+        ImGui::Image(m_aoPass.shadow_imgui_texture_id(), ImVec2(avail, previewH));
+    } else {
+        ImGui::TextDisabled("(shadow texture not ready yet)");
     }
 
     ImGui::End();

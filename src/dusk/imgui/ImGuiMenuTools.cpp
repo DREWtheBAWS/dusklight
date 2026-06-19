@@ -13,6 +13,7 @@
 #include "d/actor/d_a_alink.h"
 #include "d/actor/d_a_horse.h"
 #include "d/d_com_inf_game.h"
+#include "d/d_kankyo.h"
 #include "dusk/data.hpp"
 #include "dusk/dusk.h"
 #include "dusk/main.h"
@@ -36,7 +37,7 @@ namespace dusk {
         m_collector.set_draw_callback([](const AuroraGxCaptureDraw& draw, void* ud) {
             static_cast<rtao::BlasCache*>(ud)->record_draw(draw);
         }, &m_blasCache);
-        aurora_set_post_render_callback([](WGPUDevice device, WGPUCommandEncoder encoder, void* userdata) {
+        aurora_set_pre_ui_callback([](WGPUDevice device, WGPUCommandEncoder encoder, void* userdata) {
             auto* self = static_cast<ImGuiMenuTools*>(userdata);
 
             // When the debug capture window is not open, drive everything from persistent settings.
@@ -48,8 +49,10 @@ namespace dusk {
                 const float dist = static_cast<float>(getSettings().game.rtaoRayLength.getValue());
                 static constexpr uint32_t kQualityRays[] = {1u, 4u, 8u};
                 const int q = std::clamp(getSettings().game.rtaoQuality.getValue(), 0, 2);
-                self->m_aoPass.set_params({kQualityRays[q], dist, 0.01f, 0u, 0u});
-                self->m_aoStrength = getSettings().game.rtaoIntensity.getValue();
+                self->m_aoPass.set_params({kQualityRays[q], dist, 0.01f, 0u, 0u, 0.02f});
+                self->m_aoStrength     = getSettings().game.rtaoIntensity.getValue();
+                self->m_shadowEnabled  = getSettings().game.rtShadowEnabled.getValue();
+                self->m_shadowStrength = getSettings().game.rtShadowIntensity.getValue();
                 const int iters = getSettings().game.rtaoDenoiserIterations.getValue();
                 self->m_denoiseIterations = iters;
                 self->m_denoiseEnabled = (iters > 0);
@@ -57,17 +60,27 @@ namespace dusk {
                 self->m_aoEnabled    = true;
                 self->m_buildBvhOnly = false;
                 self->m_bvhFrozen    = false;
+                self->m_tlasBuilder.set_force_rebuild(false);
                 self->m_collector.set_max_distance(dist * 4.f);
                 self->m_collector.set_frustum_margin(dist);
                 self->m_collector.set_max_edge_length(dist * 3.f);
                 self->m_bvhBuilder.set_morton_range(dist * 4.f);
+                self->m_blasCache.set_max_distance(dist * 4.f);
             }
 
             // Build new BLASes (SAH, local space) and upload to GPU.
             // Runs unconditionally so the cache stays warm even when the LBVH is frozen.
             self->m_blasCache.flush();
 
-            // Camera data is needed for the world-space TLAS build and the AO passes.
+            // Use the game's actual sun light position (GX lighting source) for shadow direction.
+            // sun_light_pos is the world-space position GX uses for sun diffuse/specular — it's
+            // typically very far above the scene (directional-light approximation), which is what
+            // we want for casting sun shadows.  plight_near_pos is a nearby point light (torch,
+            // lamp) and causes rays to aim at the scene floor/origin, blocking everything.
+            const cXyz& lightPos = g_env_light.sun_light_pos;
+            self->m_collector.set_light_world_pos(lightPos.x, lightPos.y, lightPos.z);
+
+            // Camera data is needed for the world-space TLAS build and the AO/shadow passes.
             const auto& camData  = self->m_collector.pending_camera_data();
 
             // Build the world-space TLAS over this frame's instances.
@@ -75,19 +88,11 @@ namespace dusk {
             self->m_tlasBuilder.build(self->m_blasCache, camData.view);
             self->m_tlasBuilder.flush(device);
 
-            if (self->m_useTlasBvh) {
-                // Phase 3: build GPU LBVH each frame from skinned-mesh triangles only.
-                // build() submits its own command buffer before returning, so LBVH writes
-                // are visible to the AO pass in Aurora's encoder submitted afterward.
-                if (!self->m_excludeSkinned) {
-                    const auto& dynTris = self->m_blasCache.dynamic_triangles();
-                    if (!dynTris.empty()) {
-                        self->m_bvhBuilder.upload_triangles(device, dynTris);
-                        self->m_bvhBuilder.build(device);
-                    }
-                }
-            } else {
-                // Original LBVH path: all captured geometry (single-level BVH).
+            // Sync the exclude-skinned debug flag so TlasBuilder omits the dynamic instance.
+            self->m_tlasBuilder.set_exclude_skinned(self->m_excludeSkinned);
+
+            if (!self->m_useTlasBvh) {
+                // Original single-level LBVH path (all captured geometry).
                 const bool doRebuild = !self->m_bvhFrozen || self->m_bvhCaptureOnce;
                 if (doRebuild) {
                     const auto& tris = self->m_collector.raw_triangles();
@@ -100,6 +105,15 @@ namespace dusk {
                         }
                     }
                 }
+            } else if (!self->m_excludeSkinned) {
+                // TLAS mode: GPU LBVH for skinned (multi-matrix) geometry only.
+                // BlasCache separates multi-matrix draws into dynamic_triangles() and applies
+                // the same distance filter as the collector, so only in-range skinned tris reach here.
+                const auto& dynTris = self->m_blasCache.dynamic_triangles();
+                if (!dynTris.empty()) {
+                    self->m_bvhBuilder.upload_triangles(device, dynTris);
+                    self->m_bvhBuilder.build(device);
+                }
             }
 
             // AO pass: choose LBVH or BLAS/TLAS based on user toggle.
@@ -107,17 +121,15 @@ namespace dusk {
             const auto& texViews = self->m_collector.texture_views();
             if (!self->m_buildBvhOnly) {
                 if (self->m_useTlasBvh && self->m_tlasBuilder.is_ready()) {
-                    const bool hasDyn = !self->m_excludeSkinned
-                                     && self->m_bvhBuilder.is_ready()
-                                     && !self->m_blasCache.dynamic_triangles().empty();
+                    const bool dynReady = self->m_bvhBuilder.is_ready() && !self->m_excludeSkinned;
                     self->m_aoPass.execute_tlas(device, encoder, depthTex, camData,
                                                 self->m_tlasBuilder.tlas_node_buf(),
                                                 self->m_tlasBuilder.instance_buf(),
                                                 self->m_tlasBuilder.blas_node_buf(),
                                                 self->m_tlasBuilder.blas_tri_buf(),
-                                                hasDyn ? self->m_bvhBuilder.node_buf() : nullptr,
-                                                hasDyn ? self->m_bvhBuilder.tri_buf()  : nullptr,
-                                                hasDyn ? self->m_bvhBuilder.last_stats().nodeCount : 0u,
+                                                dynReady ? self->m_bvhBuilder.node_buf() : nullptr,
+                                                dynReady ? self->m_bvhBuilder.tri_buf()  : nullptr,
+                                                dynReady ? self->m_bvhBuilder.last_stats().nodeCount : 0u,
                                                 texViews);
                 } else if (self->m_bvhBuilder.is_ready()) {
                     self->m_aoPass.execute(device, encoder, depthTex, camData,
@@ -126,7 +138,20 @@ namespace dusk {
                                            texViews);
                 }
 
-                // Denoise + composite: apply filtered AO to the EFB.
+                // Shadow pass: one ray per pixel toward the sun/light source.
+                if (self->m_shadowEnabled && self->m_useTlasBvh && self->m_tlasBuilder.is_ready()) {
+                    const bool dynReady = self->m_bvhBuilder.is_ready() && !self->m_excludeSkinned;
+                    self->m_aoPass.execute_shadow_tlas(device, encoder, depthTex, camData,
+                                                       self->m_tlasBuilder.tlas_node_buf(),
+                                                       self->m_tlasBuilder.instance_buf(),
+                                                       self->m_tlasBuilder.blas_node_buf(),
+                                                       self->m_tlasBuilder.blas_tri_buf(),
+                                                       dynReady ? self->m_bvhBuilder.node_buf() : nullptr,
+                                                       dynReady ? self->m_bvhBuilder.tri_buf()  : nullptr,
+                                                       dynReady ? self->m_bvhBuilder.last_stats().nodeCount : 0u);
+                }
+
+                // Denoise + composite: apply filtered AO and shadow to the EFB.
                 if (self->m_aoEnabled && self->m_aoPass.is_ready()) {
                     WGPUTextureView aoView = self->m_aoPass.ao_texture_view();
                     if (self->m_denoiseEnabled && self->m_denoiseIterations > 0) {
@@ -136,9 +161,19 @@ namespace dusk {
                             self->m_denoiseSigmaZ, self->m_denoiseSigmaL);
                         if (filtered) aoView = filtered;
                     }
+                    WGPUTextureView shadowView = self->m_shadowEnabled
+                                              ? self->m_aoPass.shadow_texture_view() : nullptr;
+                    if (shadowView && self->m_denoiseEnabled && self->m_denoiseIterations > 0) {
+                        WGPUTextureView filtered = self->m_shadowDenoisePass.execute(
+                            device, encoder, shadowView, depthTex,
+                            static_cast<uint32_t>(self->m_denoiseIterations),
+                            self->m_denoiseSigmaZ, self->m_denoiseSigmaL);
+                        if (filtered) shadowView = filtered;
+                    }
                     WGPUTexture colorTex = aurora_get_color_texture();
                     self->m_compositePass.execute(device, encoder, colorTex,
-                                                  aoView, self->m_aoStrength);
+                                                  aoView, self->m_aoStrength,
+                                                  shadowView, self->m_shadowStrength);
                 }
             }
         }, this);

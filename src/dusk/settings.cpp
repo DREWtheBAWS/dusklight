@@ -75,6 +75,8 @@ UserSettings g_userSettings = {
         .rtaoRayLength {"game.rtaoRayLength", 100},
         .rtaoIntensity {"game.rtaoIntensity", 1.0f},
         .rtaoDenoiserIterations {"game.rtaoDenoiserIterations", 5},
+        .rtShadowEnabled {"game.rtShadowEnabled", true},
+        .rtShadowIntensity {"game.rtShadowIntensity", 0.7f},
 
         // Audio
         .noLowHpSound {"game.noLowHpSound", false},
@@ -243,6 +245,8 @@ void registerSettings() {
     Register(g_userSettings.game.rtaoRayLength);
     Register(g_userSettings.game.rtaoIntensity);
     Register(g_userSettings.game.rtaoDenoiserIterations);
+    Register(g_userSettings.game.rtShadowEnabled);
+    Register(g_userSettings.game.rtShadowIntensity);
     Register(g_userSettings.game.enableFastIronBoots);
     Register(g_userSettings.game.canTransformAnywhere);
     Register(g_userSettings.game.fastRoll);

@@ -175,6 +175,8 @@ struct UserSettings {
         ConfigVar<int>   rtaoRayLength;
         ConfigVar<float> rtaoIntensity;
         ConfigVar<int>   rtaoDenoiserIterations;
+        ConfigVar<bool>  rtShadowEnabled;
+        ConfigVar<float> rtShadowIntensity;
 
         // Audio
         ConfigVar<bool> noLowHpSound;

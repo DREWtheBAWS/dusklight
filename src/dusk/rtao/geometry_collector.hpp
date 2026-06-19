@@ -17,10 +17,11 @@ public:
     };
 
     struct CameraData {
-        float proj[4][4] = {};   // GX projection matrix (row-major), from the first qualifying draw
-        float view[4][4] = {};   // reserved for future world-space use
-        float worldPos[3] = {};  // reserved for future world-space use
+        float proj[4][4] = {};       // GX projection matrix (row-major), from the first qualifying draw
+        float view[4][4] = {};       // GX view matrix (world→view), from GX pnMtx slot 0
+        float worldPos[3] = {};      // reserved for future world-space use
         float fovYDeg = 0.f;
+        float lightWorldPos[3] = {}; // world-space light position (from dKy_plight_near_pos)
         bool  valid = false;
     };
 
@@ -74,6 +75,12 @@ public:
     using DrawCallback = void (*)(const AuroraGxCaptureDraw&, void* userdata);
     void set_draw_callback(DrawCallback cb, void* userdata) {
         m_drawCb = cb; m_drawCbUserdata = userdata;
+    }
+
+    void set_light_world_pos(float x, float y, float z) {
+        m_pendingCameraData.lightWorldPos[0] = x;
+        m_pendingCameraData.lightWorldPos[1] = y;
+        m_pendingCameraData.lightWorldPos[2] = z;
     }
 
     // Diagnostic: total number of times the draw callback was actually invoked.
