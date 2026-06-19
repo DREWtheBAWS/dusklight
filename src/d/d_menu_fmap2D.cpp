@@ -17,7 +17,10 @@
 #include "d/d_msg_scrn_explain.h"
 #include "m_Do/m_Do_graphic.h"
 #include "d/actor/d_a_midna.h"
+#if TARGET_PC
 #include "dusk/frame_interpolation.h"
+#include "dusk/ui/touch_controls.hpp"
+#endif
 #include <cstring>
 
 #if TARGET_PC
@@ -1943,6 +1946,12 @@ void dMenu_Fmap2DBack_c::regionMapMove(STControl* i_stick) {
     calcAllMapPos2D(mArrowPos3DX + control_xpos - mStageTransX,
                     mArrowPos3DZ + control_ypos - mStageTransZ, &pos_x, &pos_y);
 
+#if TARGET_PC
+    if (dusk::getSettings().game.enableMirrorMode) {
+        pos_x = getMirrorPosX(pos_x, 0.0f);
+    }
+#endif
+
     mSelectRegion = 0xff;
     int region = mRegionCursor;
     if (region != 0xff && region != 7) {
@@ -1973,6 +1982,11 @@ void dMenu_Fmap2DBack_c::stageMapMove(STControl* i_stick, u8 param_1, bool param
     if (stick_value >= slow_bound && param_2 && field_0x1238 != 2) {
         bVar6 = true;
         s16 angle = i_stick->getAngleStick();
+#if TARGET_PC
+        if (dusk::getSettings().game.enableMirrorMode) {
+            angle = -angle;
+        }
+#endif
         f32 local_68 = mTexMaxX - mTexMinX;
         f32 spot_zoom = getSpotMapZoomRate();
         f32 region_zoom = getRegionMapZoomRate(mRegionCursor);
@@ -2482,10 +2496,26 @@ dMenu_Fmap2DTop_c::dMenu_Fmap2DTop_c(JKRExpHeap* i_heap, STControl* i_stick) {
     set3DStickString(0x524);
 #endif
 
+#if TARGET_PC
+    mpPoeCountIcon = JKR_NEW J2DPicture((ResTIMG*)JKRGetNameResource("ni_item_icon_pou.bti", dComIfGp_getItemIconArchive()));
+
+    mpPoeCountPane = JKR_NEW J2DTextBox();
+    if (mpPoeCountPane != nullptr) {
+        mpPoeCountPane->setFontSize(15.0f, 15.0f);
+        mpPoeCountPane->setFont(mDoExt_getMesgFont());
+    }
+
+    mSelectRegionNo = 0xFF;
+#endif
+
     setHIO(true);
 }
 
 dMenu_Fmap2DTop_c::~dMenu_Fmap2DTop_c() {
+#if TARGET_PC
+    dusk::ui::set_control_override(dusk::ui::Control::Z, dusk::ui::ControlOverride::Default);
+#endif
+
     deleteExplain();
     JKR_DELETE(mpTitleScreen);
     mpTitleScreen = NULL;
@@ -2540,6 +2570,14 @@ dMenu_Fmap2DTop_c::~dMenu_Fmap2DTop_c() {
     }
     JKR_DELETE(mpAnm);
     mpAnm = NULL;
+
+#if TARGET_PC
+    JKR_DELETE(mpPoeCountIcon);
+    mpPoeCountIcon = NULL;
+
+    JKR_DELETE(mpPoeCountPane);
+    mpPoeCountPane = NULL;
+#endif
 }
 
 void dMenu_Fmap2DTop_c::_execute() {
@@ -2636,6 +2674,35 @@ void dMenu_Fmap2DTop_c::draw() {
     ctx->scissor(mTransX, 0.0f, FB_WIDTH, FB_HEIGHT);
     ctx->setScissor();
     mpTitleScreen->draw(mTransX, mTransY, ctx);
+
+#if TARGET_PC
+    if (dusk::getSettings().game.enhancedMapMenus) {
+        int nowPoeCount = 0;
+        int totalPoeCount = 0;
+        dMenuMapCommon_c::getFmapPoeCount(mSelectRegionNo, nowPoeCount, totalPoeCount);
+        if (dComIfGs_isEventBit(dSv_event_flag_c::F_0456) && totalPoeCount > 0) {
+            const f32 x = mTransX + mDoGph_gInf_c::ScaleHUDXRight(485.0f);
+            const f32 y = 380.0f;
+            constexpr f32 iconsize = 48.0f * 0.8f;
+
+            if (mpPoeCountIcon != nullptr)
+                mpPoeCountIcon->draw(x - 35.0f, y - 25.0f, iconsize, iconsize, false, false, false);
+
+            char counter_text[6];
+            snprintf(counter_text, sizeof(counter_text), "%d/%d", nowPoeCount, totalPoeCount);
+            mpPoeCountPane->setString(counter_text);
+
+            mpPoeCountPane->setCharColor(0x000000FF);
+            mpPoeCountPane->setGradColor(0x000000FF);
+            mpPoeCountPane->draw(x + 1, y + 1, FB_WIDTH, HBIND_LEFT);
+
+            mpPoeCountPane->setCharColor(0xC8C8C8FF);
+            mpPoeCountPane->setGradColor(0xC8C8C8FF);
+            mpPoeCountPane->draw(x, y, FB_WIDTH, HBIND_LEFT);
+        }
+    }
+#endif
+
     ctx->scissor(scissor_left, scissor_top, scissor_width, scissor_height);
     ctx->setScissor();
     if (mpScrnExplain) {
@@ -2681,7 +2748,7 @@ void dMenu_Fmap2DTop_c::setTitleNameString(u32 param_0) {
 #endif
     for (int i = 0; i < 7; i++) {
         if (param_0 == 0) {
-            strcpy(((J2DTextBox*)(mpTitleScreen->search(setTitleNameString_font_name[i])))
+            SAFE_STRCPY(((J2DTextBox*)(mpTitleScreen->search(setTitleNameString_font_name[i])))
                        ->getStringPtr(),
                    "");
         } else {
@@ -2704,7 +2771,7 @@ void dMenu_Fmap2DTop_c::setAreaNameString(u32 param_0) {
 #endif
     for (int i = 0; i < 3; i++) {
         if (param_0 == 0) {
-            strcpy(((J2DTextBox*)(mpTitleScreen->search(setAreaNameString_area_name[i])))
+            SAFE_STRCPY(((J2DTextBox*)(mpTitleScreen->search(setAreaNameString_area_name[i])))
                        ->getStringPtr(),
                    "");
         } else {
@@ -2721,6 +2788,12 @@ void dMenu_Fmap2DTop_c::setZButtonString(u32 param_0, u8 i_alpha) {
     if (param_0 == 0x529 && ((daMidna_c*)daPy_py_c::getMidnaActor())->checkPortalObjRide()) {
         param_0 = 0x533;
     }
+
+#if TARGET_PC
+    dusk::ui::set_control_override(dusk::ui::Control::Z,
+        param_0 != 0 && isWarpAccept() ? dusk::ui::ControlOverride::Action :
+                                         dusk::ui::ControlOverride::Default);
+#endif
 
 #if VERSION == VERSION_GCN_JPN
     static const u64 cont_zt[5] = {MULTI_CHAR('cont_zt'), MULTI_CHAR('cont_zt1'), MULTI_CHAR('cont_zt2'), MULTI_CHAR('cont_zt3'), MULTI_CHAR('cont_zt4')};
@@ -2817,7 +2890,7 @@ void dMenu_Fmap2DTop_c::setCrossLRString(u32 param_0) {
     if (param_0 == 0) {
         for (int i = 0; i < 5; i++) {
             J2DTextBox* text_box = static_cast<J2DTextBox*>(mpTitleScreen->search(juji_c[i]));
-            strcpy(text_box->getStringPtr(), "");
+            SAFE_STRCPY(text_box->getStringPtr(), "");
         }
         mpTitleScreen->search(MULTI_CHAR('juy_sha0'))->show();
         mAlphaDpad = 1;
@@ -2842,7 +2915,7 @@ void dMenu_Fmap2DTop_c::set3DStickString(u32 param_0) {
     if (param_0 == 0) {
         for (int i = 0; i < 5; i++) {
             J2DTextBox* text_box = static_cast<J2DTextBox*>(mpTitleScreen->search(ast_c[i]));
-            strcpy(text_box->getStringPtr(), "");
+            SAFE_STRCPY(text_box->getStringPtr(), "");
         }
         mpTitleScreen->search(MULTI_CHAR('as_sha0'))->show();
         mAlphaAnalogStick = 1;
