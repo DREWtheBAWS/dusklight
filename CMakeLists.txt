@@ -314,7 +314,10 @@ FetchContent_Declare(Catch2
     URL https://github.com/catchorg/Catch2/archive/refs/tags/v3.7.1.tar.gz
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
+set(CATCH_BUILD_STATIC_LIBRARY ON CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF)
 FetchContent_MakeAvailable(Catch2)
+unset(BUILD_SHARED_LIBS)
 
 if (DUSK_ENABLE_SENTRY_NATIVE)
     message(STATUS "dusklight: Fetching sentry-native")
