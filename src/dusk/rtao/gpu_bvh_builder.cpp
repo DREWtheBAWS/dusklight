@@ -1,4 +1,5 @@
 #include "gpu_bvh_builder.hpp"
+#include <aurora/post_render.h>
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -355,13 +356,14 @@ static WGPUBuffer make_buf(WGPUDevice dev, uint64_t size, WGPUBufferUsage usage,
                             const void* data = nullptr) {
     if (size == 0) size = 4; // WebGPU rejects zero-size buffers
     WGPUBufferDescriptor d{};
-    d.size  = size;
-    d.usage = usage | WGPUBufferUsage_CopyDst;
+    d.size              = size;
+    d.usage             = usage | WGPUBufferUsage_CopyDst;
+    d.mappedAtCreation  = data != nullptr;
     WGPUBuffer buf = wgpuDeviceCreateBuffer(dev, &d);
     if (data) {
-        WGPUQueue q = wgpuDeviceGetQueue(dev);
-        wgpuQueueWriteBuffer(q, buf, 0, data, size);
-        wgpuQueueRelease(q);
+        void* ptr = wgpuBufferGetMappedRange(buf, 0, size);
+        if (ptr) memcpy(ptr, data, size);
+        wgpuBufferUnmap(buf);
     }
     return buf;
 }
@@ -522,7 +524,7 @@ void GpuBvhBuilder::upload_triangles(WGPUDevice device,
 // build() — record uploads + all passes + copy into the caller's encoder
 // ---------------------------------------------------------------------------
 
-void GpuBvhBuilder::build(WGPUDevice device) {
+void GpuBvhBuilder::build(WGPUDevice device, WGPUCommandEncoder encoder) {
     if (m_triCount == 0 || !m_triInputBuf) return;
 
     ensure_pipelines(device);
@@ -588,21 +590,16 @@ void GpuBvhBuilder::build(WGPUDevice device) {
     // writes are flushed before executing any subsequently submitted command buffer,
     // making the data unconditionally visible to every compute pass.
     {
-        WGPUQueue q = wgpuDeviceGetQueue(device);
+        WGPUQueue q = aurora_get_queue();
         const uint64_t triBytes = uint64_t(m_triCount) * 80u;
         wgpuQueueWriteBuffer(q, m_triInputBuf,  0, m_pendingTriData.data(), triBytes);
         wgpuQueueWriteBuffer(q, m_sceneAabbBuf, 0, mortonAabb,              sizeof(mortonAabb));
         wgpuQueueWriteBuffer(q, m_sortStepsBuf, 0, stepsBlob.data(),        stepsBlob.size());
-        wgpuQueueRelease(q);
     }
 
-    // Dedicated command encoder for the compute passes only (no copies).
-    // Submitted immediately after recording; the AO pass runs in Aurora's encoder
-    // which is submitted after this function returns, so queue ordering guarantees
-    // BVH node writes are visible to the AO pass.
-    WGPUCommandEncoderDescriptor encDesc{};
-    WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(device, &encDesc);
-
+    // BVH compute passes are recorded directly into Aurora's encoder.
+    // wgpuQueueWriteBuffer above guarantees data is visible before the command
+    // buffer executes. Dawn inserts UAV barriers between consecutive compute passes.
     WGPUBindGroupEntry bge[8] = {};
     bge[0] = { .binding = 0, .buffer = m_triInputBuf,  .size = WGPU_WHOLE_SIZE };
     bge[1] = { .binding = 1, .buffer = m_aabbBuf,      .size = WGPU_WHOLE_SIZE };
@@ -648,17 +645,6 @@ void GpuBvhBuilder::build(WGPUDevice device) {
     const auto t1 = std::chrono::steady_clock::now();
 
     wgpuBindGroupRelease(bg);
-
-    // Finish, submit, and release the dedicated BVH encoder.
-    // Dawn holds references to all referenced buffers until the command buffer
-    // completes, so releasing the staging buffers above was safe.
-    WGPUCommandBufferDescriptor cbDesc{};
-    WGPUCommandBuffer cb = wgpuCommandEncoderFinish(encoder, &cbDesc);
-    wgpuCommandEncoderRelease(encoder);
-    WGPUQueue q = wgpuDeviceGetQueue(device);
-    wgpuQueueSubmit(q, 1, &cb);
-    wgpuCommandBufferRelease(cb);
-    wgpuQueueRelease(q);
 
     m_lastStats = {n, 2u * n - 1u,
                    std::chrono::duration<float, std::milli>(t1 - t0).count(),

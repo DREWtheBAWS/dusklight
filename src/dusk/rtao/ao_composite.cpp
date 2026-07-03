@@ -1,4 +1,5 @@
 #include "ao_composite.hpp"
+#include <aurora/post_render.h>
 
 namespace dusk::rtao {
 
@@ -186,12 +187,10 @@ void AoCompositePass::rebuild_bind_group(WGPUDevice device) {
         m_whiteTex  = wgpuDeviceCreateTexture(device, &td);
         m_whiteView = wgpuTextureCreateView(m_whiteTex, nullptr);
         const uint8_t white[4] = {255, 255, 255, 255};
-        WGPUQueue q = wgpuDeviceGetQueue(device);
         WGPUTexelCopyTextureInfo ict{}; ict.texture = m_whiteTex;
         WGPUTexelCopyBufferLayout tdl{}; tdl.bytesPerRow = 4; tdl.rowsPerImage = 1;
         WGPUExtent3D ext{1, 1, 1};
-        wgpuQueueWriteTexture(q, &ict, white, 4, &tdl, &ext);
-        wgpuQueueRelease(q);
+        wgpuQueueWriteTexture(aurora_get_queue(), &ict, white, 4, &tdl, &ext);
     }
 
     WGPUTextureView shadowView = m_lastShadowView ? m_lastShadowView : m_whiteView;
@@ -253,9 +252,7 @@ void AoCompositePass::execute(WGPUDevice device, WGPUCommandEncoder encoder,
     // Update params uniform: {ao_strength, shadow_strength, pad, pad} = 16 bytes.
     struct alignas(16) ParamsData { float ao_strength; float shadow_strength; float pad[2]; };
     const ParamsData params{aoStrength, shadowStrength, {}};
-    WGPUQueue q = wgpuDeviceGetQueue(device);
-    wgpuQueueWriteBuffer(q, m_paramsUbo, 0, &params, sizeof(params));
-    wgpuQueueRelease(q);
+    wgpuQueueWriteBuffer(aurora_get_queue(), m_paramsUbo, 0, &params, sizeof(params));
 
     // Render pass: sample colorTex → write to scratch.
     // (colorTex cannot be simultaneously sampled and rendered into; scratch avoids aliasing.)

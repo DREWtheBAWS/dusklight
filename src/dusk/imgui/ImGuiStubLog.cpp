@@ -93,7 +93,18 @@ namespace dusk {
         std::lock_guard lock(StubLogMutex);
         ClearPastFrame();
         m_collector.end_frame();
+        // Build pending SAH BVHs here on the main thread rather than inside the
+        // pre-UI callback (which runs on the render worker). The render worker
+        // blocked the main thread for the duration of up to kMaxBuildsPerFrame
+        // SAH builds, causing multi-second stalls when new areas were loaded.
+        // Running flush() here overlaps with the render worker encoding the
+        // previous frame, so the cost is hidden behind that work.
+        m_blasCache.flush();
         m_blasCache.advance_frame();
-        m_tlasBuilder.advance_frame();
+        // m_tlasBuilder.advance_frame() intentionally NOT called here.
+        // advance_frame() clears m_instances, which races with build() firing on the
+        // render worker thread via encode_op's preUI callback. build() manages
+        // m_instances internally (slow path rebuilds it, fast path reuses it),
+        // so the afterDraw clear is redundant and unsafe.
     }
 }

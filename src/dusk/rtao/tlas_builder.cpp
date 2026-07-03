@@ -1,4 +1,5 @@
 #include "tlas_builder.hpp"
+#include <aurora/post_render.h>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -118,13 +119,21 @@ static uint32_t tlas_build_node(std::vector<TlasItem>& items,
     return idx;
 }
 
-static void tlas_link_node(std::vector<BvhNode>& nodes, uint32_t idx, uint32_t miss) {
-    BvhNode& n = nodes[idx];
-    if (n.tri_count > 0) { n.miss_next = miss; return; }
-    const uint32_t right = n.miss_next;
-    n.miss_next = miss;
-    tlas_link_node(nodes, n.hit_next, right);
-    tlas_link_node(nodes, right, miss);
+// Iterative version to avoid stack overflow on degenerate (deep) trees.
+static void tlas_link_node(std::vector<BvhNode>& nodes, uint32_t root, uint32_t rootMiss) {
+    struct Frame { uint32_t idx; uint32_t miss; };
+    std::vector<Frame> stk;
+    stk.reserve(64);
+    stk.push_back({root, rootMiss});
+    while (!stk.empty()) {
+        auto [idx, miss] = stk.back(); stk.pop_back();
+        BvhNode& n = nodes[idx];
+        if (n.tri_count > 0) { n.miss_next = miss; continue; }
+        const uint32_t right = n.miss_next;
+        n.miss_next = miss;
+        stk.push_back({right, miss});       // pushed second = processed second
+        stk.push_back({n.hit_next, right}); // pushed first  = processed first
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -132,14 +141,18 @@ static void tlas_link_node(std::vector<BvhNode>& nodes, uint32_t idx, uint32_t m
 // ---------------------------------------------------------------------------
 
 static WGPUBuffer upload_gpu(WGPUDevice dev, const void* data, size_t size) {
-    if (size == 0) size = 4;
     WGPUBufferDescriptor d{};
-    d.size  = size;
     d.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
+    if (size == 0 || !data) {
+        d.size = 4;
+        return wgpuDeviceCreateBuffer(dev, &d);
+    }
+    d.size = size;
+    d.mappedAtCreation = true;
     WGPUBuffer buf = wgpuDeviceCreateBuffer(dev, &d);
-    WGPUQueue q = wgpuDeviceGetQueue(dev);
-    wgpuQueueWriteBuffer(q, buf, 0, data, size);
-    wgpuQueueRelease(q);
+    void* ptr = wgpuBufferGetMappedRange(buf, 0, size);
+    if (ptr) memcpy(ptr, data, size);
+    wgpuBufferUnmap(buf);
     return buf;
 }
 
@@ -553,8 +566,10 @@ void TlasBuilder::flush(WGPUDevice device) {
             }
             const uint32_t count  = static_cast<uint32_t>(m_instances.size());
             const size_t   needed = count * sizeof(GpuTlasInstance);
+            // Reuse the existing buffer if it is large enough; only reallocate on growth.
+            // wgpuQueueWriteBuffer is a queue-level op — data is guaranteed visible before
+            // the command buffer executes, so there is no D3D12 stale-read hazard.
             if (!m_instanceBuf || count > m_instanceBufCap) {
-                // Buffer too small (shouldn't happen when structural hash stable, but guard).
                 release_buf(m_instanceBuf);
                 WGPUBufferDescriptor d{};
                 d.size  = needed;
@@ -562,9 +577,7 @@ void TlasBuilder::flush(WGPUDevice device) {
                 m_instanceBuf    = wgpuDeviceCreateBuffer(device, &d);
                 m_instanceBufCap = count;
             }
-            WGPUQueue q = wgpuDeviceGetQueue(device);
-            wgpuQueueWriteBuffer(q, m_instanceBuf, 0, gpu.data(), needed);
-            wgpuQueueRelease(q);
+            wgpuQueueWriteBuffer(aurora_get_queue(), m_instanceBuf, 0, gpu.data(), needed);
         }
     }
 
@@ -579,48 +592,23 @@ void TlasBuilder::flush(WGPUDevice device) {
         const uint32_t minNodes = std::max(m_staticBlasNodeCount, 1u);
         const uint32_t minTris  = std::max(m_staticBlasTriCount,  1u);
 
-        if (!m_blasNodeBuf || minNodes > m_blasNodeBufCapacity) {
-            release_buf(m_blasNodeBuf);
-            m_blasNodeBufCapacity = minNodes + minNodes / 4 + 64;
-            WGPUBufferDescriptor d{};
-            d.size  = uint64_t(m_blasNodeBufCapacity) * sizeof(BlasCache::GpuNode);
-            d.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
-            m_blasNodeBuf = wgpuDeviceCreateBuffer(device, &d);
-            m_blasNodesDirty = true;  // must re-upload static region after buffer recreate
-        }
-        if (!m_blasTriBuf || minTris > m_blasTriBufCapacity) {
-            release_buf(m_blasTriBuf);
-            m_blasTriBufCapacity = minTris + minTris / 4 + 64;
-            WGPUBufferDescriptor d{};
-            d.size  = uint64_t(m_blasTriBufCapacity) * sizeof(BlasCache::GpuTri);
-            d.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
-            m_blasTriBuf = wgpuDeviceCreateBuffer(device, &d);
-            m_blasNodesDirty = true;
-        }
-
-        WGPUQueue q = wgpuDeviceGetQueue(device);
-
         if (m_blasNodesDirty) {
-            // Upload only the newly-appended delta unless a full rebuild was triggered.
-            const uint32_t nodeStart = m_blasFullRebuildPending ? 0 : m_uploadedNodeCount;
-            const uint32_t triStart  = m_blasFullRebuildPending ? 0 : m_uploadedTriCount;
-            if (m_staticBlasNodeCount > nodeStart)
-                wgpuQueueWriteBuffer(q, m_blasNodeBuf,
-                    uint64_t(nodeStart) * sizeof(BlasCache::GpuNode),
-                    m_pendingBlasNodes.data() + nodeStart,
-                    (m_staticBlasNodeCount - nodeStart) * sizeof(BlasCache::GpuNode));
-            if (m_staticBlasTriCount > triStart)
-                wgpuQueueWriteBuffer(q, m_blasTriBuf,
-                    uint64_t(triStart) * sizeof(BlasCache::GpuTri),
-                    m_pendingBlasTris.data() + triStart,
-                    (m_staticBlasTriCount - triStart) * sizeof(BlasCache::GpuTri));
+            // Full re-upload using mappedAtCreation (avoids wgpuQueueWriteBuffer).
+            release_buf(m_blasNodeBuf);
+            release_buf(m_blasTriBuf);
+            m_blasNodeBuf = upload_gpu(device,
+                m_pendingBlasNodes.empty() ? nullptr : m_pendingBlasNodes.data(),
+                m_staticBlasNodeCount * sizeof(BlasCache::GpuNode));
+            m_blasTriBuf  = upload_gpu(device,
+                m_pendingBlasTris.empty() ? nullptr : m_pendingBlasTris.data(),
+                m_staticBlasTriCount  * sizeof(BlasCache::GpuTri));
+            m_blasNodeBufCapacity    = minNodes;
+            m_blasTriBufCapacity     = minTris;
             m_blasNodesDirty         = false;
             m_blasFullRebuildPending = false;
             m_uploadedNodeCount      = m_staticBlasNodeCount;
             m_uploadedTriCount       = m_staticBlasTriCount;
         }
-
-        wgpuQueueRelease(q);
     }
 
     // Update stats; keep node count / root AABB from the last full rebuild when nodes are cached.

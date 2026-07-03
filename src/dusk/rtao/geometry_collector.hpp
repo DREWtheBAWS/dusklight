@@ -14,6 +14,7 @@ public:
     struct Stats {
         uint32_t triangleCount = 0;
         uint32_t drawCallCount = 0;
+        float    decodeMs      = 0.f; // CPU time spent in decode/cull/subdivide this frame
     };
 
     struct CameraData {
@@ -25,8 +26,12 @@ public:
         bool  valid = false;
     };
 
-    // Call once at startup to register the Aurora capture callback.
+    // Register the Aurora geometry capture callback. Safe to call from render worker
+    // thread when main thread is blocked in acquire_frame_slot.
     void install();
+    // Clear the capture callback. Calling this stops the per-draw CPU work for
+    // triangle decode/subdivision until install() is called again.
+    void uninstall();
 
     // Called at the end of each ImGui frame (from afterDraw).
     void end_frame();
@@ -96,6 +101,7 @@ private:
 
     std::vector<Triangle> m_triangles;
     uint32_t m_drawCallCount = 0;
+    float    m_decodeMsAccum = 0.f;
 
     Stats       m_lastStats;
     std::string m_pendingDumpPath;

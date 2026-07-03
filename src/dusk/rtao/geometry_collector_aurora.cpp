@@ -7,4 +7,8 @@ void GeometryCollector::install() {
     aurora_set_geometry_capture(&GeometryCollector::on_capture, this);
 }
 
+void GeometryCollector::uninstall() {
+    aurora_set_geometry_capture(nullptr, nullptr);
+}
+
 } // namespace dusk::rtao

@@ -33,6 +33,18 @@ static BlasKey compute_blas_key(const AuroraGxCaptureDraw& draw) {
 
 BlasCache::~BlasCache() = default;
 
+// Accumulates elapsed milliseconds into a float on scope exit — record_draw has
+// many early returns, so per-call timing needs RAII rather than manual bookends.
+struct ScopeMsAccum {
+    std::chrono::high_resolution_clock::time_point t0 = std::chrono::high_resolution_clock::now();
+    float& acc;
+    explicit ScopeMsAccum(float& a) : acc(a) {}
+    ~ScopeMsAccum() {
+        acc += std::chrono::duration<float, std::milli>(
+            std::chrono::high_resolution_clock::now() - t0).count();
+    }
+};
+
 uint32_t BlasCache::record_draw(const AuroraGxCaptureDraw& draw) {
     // Deferred clear: instances from the previous aurora_end_frame stay alive through
     // all PreDraw() calls (even multiple per aurora frame) and are cleared here on the
@@ -40,8 +52,10 @@ uint32_t BlasCache::record_draw(const AuroraGxCaptureDraw& draw) {
     if (m_instancesClearPending) {
         m_instances.clear();
         m_dynamicTrisBuf.clear();
+        m_recordMsAccum = 0.f;
         m_instancesClearPending = false;
     }
+    ScopeMsAccum recTimer(m_recordMsAccum);
 
     ++m_totalCallsThisFrame;
     ++m_totalCallsEver;
@@ -188,6 +202,7 @@ void BlasCache::advance_frame() {
     m_lastStats.rejectedDirect      = m_rejectedDirect;
     m_lastStats.rejectedSkinned     = m_rejectedSkinned;
     m_lastStats.totalCallsThisFrame = m_totalCallsThisFrame;
+    m_lastStats.recordMs            = m_recordMsAccum;
     // Save instance count from the just-completed aurora_end_frame before deferring the clear.
     m_lastStats.instanceCount       = static_cast<uint32_t>(m_instances.size());
 

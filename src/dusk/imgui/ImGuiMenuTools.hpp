@@ -68,7 +68,8 @@ namespace dusk {
         int m_inputOverlayCorner = 3;
         std::string m_controllerName;
 
-        bool  m_showRtaoCapture  = false;
+        bool  m_showRtaoCapture   = false;
+        bool  m_captureInstalled  = false; // true once install() has been called
         bool  m_buildBvhOnly    = false;  // debug: skip AO pass after BVH build
         bool  m_bvhFrozen       = false;  // debug: stop rebuilding BVH each frame
         bool  m_bvhCaptureOnce  = false;  // debug: do one rebuild then auto-freeze
@@ -79,6 +80,8 @@ namespace dusk {
         bool     m_shadowEnabled      = true;   // run RT shadow pass each frame
         float    m_shadowStrength     = 0.0f;   // [0,1] blend factor for shadow composite
         bool     m_denoiseEnabled     = true;
+        float    m_preUiMs            = 0.f;  // CPU ms of the whole preUICb body (last frame)
+        float    m_rtEncodeMs         = 0.f;  // CPU ms of the RT section: TLAS build → composite
         int      m_denoiseIterations  = 4;
         float    m_denoiseSigmaZ      = 1.0f;
         float    m_denoiseSigmaL      = 1.0f;

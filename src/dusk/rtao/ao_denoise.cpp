@@ -1,4 +1,5 @@
 #include "ao_denoise.hpp"
+#include <aurora/post_render.h>
 #include <cstring>
 
 namespace dusk::rtao {
@@ -219,12 +220,11 @@ void AoDenoisePass::rebuild_bind_groups(WGPUDevice device, WGPUTextureView aoVie
 void AoDenoisePass::update_ubos(WGPUDevice device, float sigmaZ, float sigmaL) {
     struct alignas(16) Params { uint32_t step; float sigmaZ; float sigmaL; float pad; };
 
-    WGPUQueue q = wgpuDeviceGetQueue(device);
+    WGPUQueue q = aurora_get_queue();
     for (uint32_t i = 0; i < kMaxIterations; ++i) {
         const Params p{1u << i, sigmaZ, sigmaL, 0.f};
         wgpuQueueWriteBuffer(q, m_ubo[i], 0, &p, sizeof(p));
     }
-    wgpuQueueRelease(q);
 
     m_lastSigmaZ = sigmaZ;
     m_lastSigmaL = sigmaL;

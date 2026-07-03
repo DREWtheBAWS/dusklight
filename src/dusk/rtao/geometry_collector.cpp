@@ -1,5 +1,6 @@
 #include "geometry_collector.hpp"
 #include <aurora/geometry_capture.h>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 
@@ -55,6 +56,7 @@ void GeometryCollector::process_draw(const AuroraGxCaptureDraw* draw) {
     if (m_pendingTriClear) {
         m_triangles.clear();
         m_drawCallCount      = 0;
+        m_decodeMsAccum      = 0.f;
         m_pendingCameraData  = {};
         m_texViewToSlot.clear();
         m_textureViews.clear();
@@ -130,6 +132,7 @@ void GeometryCollector::process_draw(const AuroraGxCaptureDraw* draw) {
             texSlot = found->second;
     }
 
+    const auto decodeT0 = std::chrono::high_resolution_clock::now();
     auto tris = decode_triangles(*draw);
     decode_uvs(*draw, tris, texSlot);
     const float r2  = m_maxAoDistance * m_maxAoDistance;
@@ -172,10 +175,13 @@ void GeometryCollector::process_draw(const AuroraGxCaptureDraw* draw) {
         }
         m_triangles.push_back(t);
     }
+    m_decodeMsAccum += std::chrono::duration<float, std::milli>(
+        std::chrono::high_resolution_clock::now() - decodeT0).count();
 }
 
 void GeometryCollector::end_frame() {
-    m_lastStats      = { static_cast<uint32_t>(m_triangles.size()), m_drawCallCount };
+    m_lastStats      = { static_cast<uint32_t>(m_triangles.size()), m_drawCallCount,
+                         m_decodeMsAccum };
     m_lastCameraData = m_pendingCameraData;
 
     if (!m_pendingDumpPath.empty()) {

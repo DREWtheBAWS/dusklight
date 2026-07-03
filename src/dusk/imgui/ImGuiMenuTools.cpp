@@ -1,7 +1,6 @@
 #include "fmt/format.h"
 #include "imgui.h"
 #include "aurora/gfx.h"
-
 #include "ImGuiConfig.hpp"
 #include "dusk/hotkeys.h"
 #include "dusk/settings.h"
@@ -20,6 +19,7 @@
 #include "m_Do/m_Do_main.h"
 
 #include <algorithm>
+#include <chrono>
 #include <aurora/lib/internal.hpp>
 #include <SDL3/SDL_misc.h>
 
@@ -33,19 +33,53 @@ extern bool enableLodBias;
 
 namespace dusk {
     ImGuiMenuTools::ImGuiMenuTools() {
-        m_collector.install();
+        // Do NOT call m_collector.install() here. The geometry capture callback runs
+        // on every GXCallDisplayListLE call (inline drain + process), so installing it
+        // unconditionally costs ~1800ms/frame even when RTAO is disabled. Lazy-install
+        // inside the preUICb instead, which only fires when the frame is being rendered.
         m_collector.set_draw_callback([](const AuroraGxCaptureDraw& draw, void* ud) {
             static_cast<rtao::BlasCache*>(ud)->record_draw(draw);
         }, &m_blasCache);
         aurora_set_pre_ui_callback([](WGPUDevice device, WGPUCommandEncoder encoder, void* userdata) {
             auto* self = static_cast<ImGuiMenuTools*>(userdata);
 
+            // Stores elapsed ms on scope exit so the early returns below are covered too.
+            struct ScopeMsStore {
+                std::chrono::high_resolution_clock::time_point t0;
+                float& out;
+                ~ScopeMsStore() {
+                    out = std::chrono::duration<float, std::milli>(
+                        std::chrono::high_resolution_clock::now() - t0).count();
+                }
+            };
+            ScopeMsStore preUiTimer{std::chrono::high_resolution_clock::now(), self->m_preUiMs};
+            self->m_rtEncodeMs = 0.f; // stays 0 on the early-return paths below
+
+            // Determine whether geometry capture and RT work are needed this frame.
+            const bool rtaoNeeded = self->m_showRtaoCapture ||
+                                    getSettings().game.rtaoEnabled.getValue();
+
+            // Install or uninstall the geometry capture callback based on need.
+            // Called from render worker — safe because the main thread is blocked in
+            // acquire_frame_slot during the render worker's frame processing.
+            if (!rtaoNeeded) {
+                if (self->m_captureInstalled) {
+                    self->m_collector.uninstall();
+                    self->m_captureInstalled = false;
+                }
+                return;
+            }
+            if (!self->m_captureInstalled) {
+                self->m_collector.install();
+                self->m_captureInstalled = true;
+                // The draw calls for this frame already ran before preUICb fires.
+                // No geometry was captured yet — defer RT work to the next frame.
+                return;
+            }
+
             // When the debug capture window is not open, drive everything from persistent settings.
             // The capture window overrides these each frame when it is visible.
             if (!self->m_showRtaoCapture) {
-                if (!getSettings().game.rtaoEnabled.getValue()) {
-                    return; // Skip all RT work — zero GPU overhead
-                }
                 const float dist = static_cast<float>(getSettings().game.rtaoRayLength.getValue());
                 static constexpr uint32_t kQualityRays[] = {1u, 4u, 8u};
                 const int q = std::clamp(getSettings().game.rtaoQuality.getValue(), 0, 2);
@@ -68,9 +102,9 @@ namespace dusk {
                 self->m_blasCache.set_max_distance(dist * 4.f);
             }
 
-            // Build new BLASes (SAH, local space) and upload to GPU.
-            // Runs unconditionally so the cache stays warm even when the LBVH is frozen.
-            self->m_blasCache.flush();
+            // SAH BVH builds (flush) now happen in afterDraw() on the main thread —
+            // not here — to avoid stalling the render worker for up to kMaxBuildsPerFrame
+            // builds (which caused multi-second freezes when entering new areas).
 
             // Use the game's actual sun light position (GX lighting source) for shadow direction.
             // sun_light_pos is the world-space position GX uses for sun diffuse/specular — it's
@@ -82,6 +116,8 @@ namespace dusk {
 
             // Camera data is needed for the world-space TLAS build and the AO/shadow passes.
             const auto& camData  = self->m_collector.pending_camera_data();
+
+            ScopeMsStore rtEncodeTimer{std::chrono::high_resolution_clock::now(), self->m_rtEncodeMs};
 
             // Build the world-space TLAS over this frame's instances.
             // Must run after m_blasCache.flush() so all BLAS entries are available.
@@ -98,7 +134,7 @@ namespace dusk {
                     const auto& tris = self->m_collector.raw_triangles();
                     if (!tris.empty()) {
                         self->m_bvhBuilder.upload_triangles(device, tris);
-                        self->m_bvhBuilder.build(device);
+                        self->m_bvhBuilder.build(device, encoder);
                         if (self->m_bvhCaptureOnce) {
                             self->m_bvhFrozen      = true;
                             self->m_bvhCaptureOnce = false;
@@ -112,7 +148,7 @@ namespace dusk {
                 const auto& dynTris = self->m_blasCache.dynamic_triangles();
                 if (!dynTris.empty()) {
                     self->m_bvhBuilder.upload_triangles(device, dynTris);
-                    self->m_bvhBuilder.build(device);
+                    self->m_bvhBuilder.build(device, encoder);
                 }
             }
 

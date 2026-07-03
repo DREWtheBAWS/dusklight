@@ -1068,12 +1068,12 @@ static WGPUBuffer create_buffer(WGPUDevice device, uint64_t size, WGPUBufferUsag
     WGPUBufferDescriptor desc{};
     desc.size             = size;
     desc.usage            = usage | WGPUBufferUsage_CopyDst;
-    desc.mappedAtCreation = false;
+    desc.mappedAtCreation = data != nullptr;
     WGPUBuffer buf = wgpuDeviceCreateBuffer(device, &desc);
     if (data) {
-        WGPUQueue q = wgpuDeviceGetQueue(device);
-        wgpuQueueWriteBuffer(q, buf, 0, data, size);
-        wgpuQueueRelease(q);
+        void* ptr = wgpuBufferGetMappedRange(buf, 0, size);
+        if (ptr) memcpy(ptr, data, size);
+        wgpuBufferUnmap(buf);
     }
     return buf;
 }
@@ -1960,21 +1960,17 @@ void AoPass::execute(WGPUDevice device, WGPUCommandEncoder encoder,
         m_fallbackView = wgpuTextureCreateView(m_fallbackTex, nullptr);
         // 1×1 fully opaque white — sample_alpha returns 1.0 (opaque) for empty slots
         const uint8_t white[4] = {255, 255, 255, 255};
-        WGPUQueue fq = wgpuDeviceGetQueue(device);
         WGPUTexelCopyTextureInfo ict{};
         ict.texture  = m_fallbackTex;
         WGPUTexelCopyBufferLayout tdl{};
         tdl.bytesPerRow  = 4;
         tdl.rowsPerImage = 1;
         WGPUExtent3D ext{1, 1, 1};
-        wgpuQueueWriteTexture(fq, &ict, white, 4, &tdl, &ext);
-        wgpuQueueRelease(fq);
+        wgpuQueueWriteTexture(aurora_get_queue(), &ict, white, 4, &tdl, &ext);
         m_bindGroupDirty = true;
     }
 
-    WGPUQueue q = wgpuDeviceGetQueue(device);
-    wgpuQueueWriteBuffer(q, m_cameraUbo, 0, &gpuCam, sizeof(GpuCamera));
-    wgpuQueueRelease(q);
+    wgpuQueueWriteBuffer(aurora_get_queue(), m_cameraUbo, 0, &gpuCam, sizeof(GpuCamera));
 
     if (m_bindGroupDirty)
         rebuild_bind_group(device);
@@ -2069,19 +2065,15 @@ void AoPass::execute_tlas(WGPUDevice device, WGPUCommandEncoder encoder,
         m_fallbackTex  = wgpuDeviceCreateTexture(device, &ftd);
         m_fallbackView = wgpuTextureCreateView(m_fallbackTex, nullptr);
         const uint8_t white[4] = {255,255,255,255};
-        WGPUQueue fq = wgpuDeviceGetQueue(device);
         WGPUTexelCopyTextureInfo ict{}; ict.texture = m_fallbackTex;
         WGPUTexelCopyBufferLayout tdl{}; tdl.bytesPerRow = 4; tdl.rowsPerImage = 1;
         WGPUExtent3D ext{1,1,1};
-        wgpuQueueWriteTexture(fq, &ict, white, 4, &tdl, &ext);
-        wgpuQueueRelease(fq);
+        wgpuQueueWriteTexture(aurora_get_queue(), &ict, white, 4, &tdl, &ext);
         m_tlasBindGroupDirty = true;
         m_bindGroupDirty     = true;
     }
 
-    WGPUQueue q = wgpuDeviceGetQueue(device);
-    wgpuQueueWriteBuffer(q, m_cameraUbo, 0, &gpuCam, sizeof(GpuCamera));
-    wgpuQueueRelease(q);
+    wgpuQueueWriteBuffer(aurora_get_queue(), m_cameraUbo, 0, &gpuCam, sizeof(GpuCamera));
 
     if (m_tlasBindGroupDirty) rebuild_tlas_bind_group(device);
 
@@ -2161,9 +2153,7 @@ void AoPass::execute_shadow_tlas(WGPUDevice device, WGPUCommandEncoder encoder,
         m_shadowBindGroupDirty = true;
     }
 
-    WGPUQueue q = wgpuDeviceGetQueue(device);
-    wgpuQueueWriteBuffer(q, m_shadowCamUbo, 0, &gpuCam, sizeof(GpuCamera));
-    wgpuQueueRelease(q);
+    wgpuQueueWriteBuffer(aurora_get_queue(), m_shadowCamUbo, 0, &gpuCam, sizeof(GpuCamera));
 
     if (m_shadowBindGroupDirty) rebuild_shadow_bind_group(device);
 

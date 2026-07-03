@@ -3,6 +3,7 @@
 #include "misc/cpp/imgui_stdlib.h"
 #include "d/d_kankyo.h"
 #include <SDL3/SDL_filesystem.h>
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -33,6 +34,22 @@ void ImGuiMenuTools::ShowRtaoCaptureWindow() {
                     cam.worldPos[0], cam.worldPos[1], cam.worldPos[2], cam.fovYDeg);
     } else {
         ImGui::TextDisabled("Camera: (no data yet)");
+    }
+
+    // ---- Per-stage CPU timing (measurement harness for RT perf work) --------
+    if (ImGui::CollapsingHeader("Timing", ImGuiTreeNodeFlags_DefaultOpen)) {
+        const auto tBlas = m_blasCache.last_stats();
+        const auto tTlas = m_tlasBuilder.last_stats();
+        const auto tDyn  = m_bvhBuilder.last_stats();
+        ImGui::Text("FPS: %.1f (%.2f ms/frame)", ImGui::GetIO().Framerate,
+                    1000.f / std::max(ImGui::GetIO().Framerate, 1.f));
+        ImGui::Text("preUI callback total:   %.2f ms  (RT encode: %.2f ms)",
+                    m_preUiMs, m_rtEncodeMs);
+        ImGui::Text("collector decode (main thread): %.2f ms", stats.decodeMs);
+        ImGui::Text("BLAS record (main thread): %.2f ms  |  flush (main thread): %.2f ms",
+                    tBlas.recordMs, tBlas.flushMs);
+        ImGui::Text("TLAS build: %.2f ms  |  flush: %.2f ms", tTlas.buildMs, tTlas.flushMs);
+        ImGui::Text("dyn LBVH encode: %.2f ms (%u tris)", tDyn.buildMs, tBlas.dynTriCount);
     }
 
     ImGui::Separator();

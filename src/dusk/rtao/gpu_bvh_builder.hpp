@@ -12,9 +12,8 @@ namespace dusk::rtao {
 //
 // Call order each frame (inside the post-render callback):
 //   1. upload_triangles(device, tris)  — packs CPU data into pending upload buffer
-//   2. build(device)                   — creates own encoder, submits, flushes BVH
-//   3. ao_pass.execute(...)            — recorded into Aurora's encoder; BVH data
-//                                        guaranteed visible because build() submitted first
+//   2. build(device, encoder)          — records BVH compute passes into Aurora's encoder
+//   3. ao_pass.execute(...)            — also recorded into Aurora's encoder, after BVH passes
 class GpuBvhBuilder {
 public:
     struct Stats {
@@ -35,14 +34,13 @@ public:
     // encoder so Dawn handles COPY_DST→storage barriers within one command buffer.
     void upload_triangles(WGPUDevice device, const std::vector<Triangle>& tris);
 
-    // Build the BVH: creates its own WGPUCommandEncoder, records all passes and
-    // uploads, finishes and submits to the device queue, then releases the encoder.
-    // By submitting in a dedicated command buffer BEFORE the caller's encoder is
-    // submitted, the GPU queue ordering guarantees all BVH writes are visible to
-    // the AO pass (recorded in the caller's encoder) without relying on intra-
-    // command-buffer UAV barriers — which proved unreliable on D3D12 drivers for
-    // consecutive storage-buffer write → read pairs within the same submission.
-    void build(WGPUDevice device);
+    // Build the BVH: records all compute passes into the provided encoder (Aurora's
+    // main frame encoder). wgpuQueueWriteBuffer is called first to upload triangle
+    // data as a queue-level operation, which Dawn guarantees is visible before any
+    // subsequently submitted command buffer — avoiding the D3D12 hazard of reading
+    // stale data from a preceding CopyBufferToBuffer within the same command list.
+    // Dawn inserts UAV barriers between consecutive compute passes in the encoder.
+    void build(WGPUDevice device, WGPUCommandEncoder encoder);
 
     // Set the half-extent used for Morton AABB clamping.
     // Geometry beyond this distance from the camera gets Morton codes at the
@@ -57,9 +55,8 @@ public:
     }
 
     // Output buffers consumed by AoPass.  Always valid after the first build()
-    // call.  Because build() submits its own command buffer before returning,
-    // D3D12 implicit state promotion guarantees the buffers are in COMMON state
-    // (readable as SRV/UAV) by the time the caller's encoder runs.
+    // call.  BVH compute passes are recorded before the AO passes in the same
+    // encoder, so Dawn inserts the necessary UAV barriers automatically.
     WGPUBuffer node_buf()  const { return m_nodeBuf; }
     WGPUBuffer tri_buf()   const { return m_triBuf;  }
     uint32_t   tri_count() const { return m_triCount; }

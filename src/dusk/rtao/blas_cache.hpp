@@ -81,6 +81,7 @@ public:
         uint32_t totalCallsThisFrame; // total record_draw() calls
         uint32_t instanceCount;       // instances accumulated in last aurora_end_frame
         float    flushMs;             // CPU time for flush() this frame (ms)
+        float    recordMs;            // CPU time summed over record_draw() calls this frame (ms)
         uint32_t dynTriCount;         // skinned tris accumulated for the GPU dynamic LBVH this frame
     };
 
@@ -121,7 +122,7 @@ public:
     // After kMaxEntries BLASes are cached the queue drains and subsequent frames are free.
     static constexpr uint32_t kEvictAfterFrames  = 300;   // ~5 s at 60 fps — reduces re-eviction churn when panning
     static constexpr uint32_t kMaxEntries        = 1024;  // bounds monolithic buffer size (~8 MB); covers large outdoor scenes
-    static constexpr uint32_t kMaxBuildsPerFrame = 128;   // CPU SAH only (no GPU upload), so high budget is safe
+    static constexpr uint32_t kMaxBuildsPerFrame = 16;    // runs on main thread in afterDraw(); keep per-frame budget small
     static constexpr uint32_t kMaxDynTris        = 12000; // cap on accumulated skinned-mesh tris
 
 private:
@@ -139,6 +140,7 @@ private:
     uint32_t                                 m_rejectedDirect      = 0;
     uint32_t                                 m_rejectedSkinned     = 0;
     uint32_t                                 m_totalCallsThisFrame = 0;
+    float                                    m_recordMsAccum       = 0.f;
     uint32_t                                 m_totalCallsEver      = 0; // never reset
     uint32_t                                 m_generation          = 0; // bumped on add/evict
     uint32_t                                 m_evictionGeneration  = 0; // bumped on evict only
