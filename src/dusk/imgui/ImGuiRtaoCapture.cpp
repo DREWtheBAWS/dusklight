@@ -22,7 +22,10 @@ void ImGuiMenuTools::ShowRtaoCaptureWindow() {
     }
 
     const auto stats = m_collector.last_stats();
-    ImGui::Text("Triangles (last frame): %u", stats.triangleCount);
+    if (m_useTlasBvh)
+        ImGui::Text("Triangles (last frame): %u (collection off - TLAS mode)", stats.triangleCount);
+    else
+        ImGui::Text("Triangles (last frame): %u", stats.triangleCount);
     ImGui::Text("Draw calls (last frame): %u", stats.drawCallCount);
     ImGui::Text("BLAS callback fired (ever): %u", m_collector.draw_callback_fired_total());
     ImGui::Text("Alpha textures: %u / %u total", static_cast<uint32_t>(m_collector.texture_views().size()),

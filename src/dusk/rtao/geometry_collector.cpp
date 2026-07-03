@@ -132,6 +132,11 @@ void GeometryCollector::process_draw(const AuroraGxCaptureDraw* draw) {
             texSlot = found->second;
     }
 
+    // Collection gate: in TLAS mode the decoded triangles feed nothing (instances
+    // come from the draw callback above), so skip the decode/cull/subdivide cost.
+    // A pending OBJ dump re-enables collection until its frame has been written.
+    if (!m_collectTriangles && !m_forceCollectFrame) return;
+
     const auto decodeT0 = std::chrono::high_resolution_clock::now();
     auto tris = decode_triangles(*draw);
     decode_uvs(*draw, tris, texSlot);
@@ -184,7 +189,10 @@ void GeometryCollector::end_frame() {
                          m_decodeMsAccum };
     m_lastCameraData = m_pendingCameraData;
 
-    if (!m_pendingDumpPath.empty()) {
+    // Write the dump only once a frame has actually been collected.  When collection
+    // is off (TLAS mode), request_dump() arms m_forceCollectFrame mid-frame — after
+    // that frame's draws already ran — so the write is deferred to the next frame.
+    if (!m_pendingDumpPath.empty() && (m_collectTriangles || !m_triangles.empty())) {
         if (write_obj(m_pendingDumpPath)) {
             m_lastDumpMsg = "Saved " + std::to_string(m_lastStats.triangleCount) +
                             " tris to " + m_pendingDumpPath;
@@ -192,13 +200,15 @@ void GeometryCollector::end_frame() {
             m_lastDumpMsg = "Write failed: " + m_pendingDumpPath;
         }
         m_pendingDumpPath.clear();
+        m_forceCollectFrame = false;
     }
 
     m_pendingTriClear = true;
 }
 
 void GeometryCollector::request_dump(std::string path) {
-    m_pendingDumpPath = std::move(path);
+    m_pendingDumpPath   = std::move(path);
+    m_forceCollectFrame = true; // ensures the next frame decodes even in TLAS mode
 }
 
 bool GeometryCollector::write_obj(const std::string& path) const {

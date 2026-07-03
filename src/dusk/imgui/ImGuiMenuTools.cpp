@@ -102,6 +102,12 @@ namespace dusk {
                 self->m_blasCache.set_max_distance(dist * 4.f);
             }
 
+            // TLAS mode needs no decoded triangles: instances come from the BlasCache
+            // draw callback and camera/alpha-texture capture happens before the decode.
+            // Disabling collection skips the per-draw decode/cull/subdivide cost on the
+            // main thread (the dominant CPU cost of the capture callback).
+            self->m_collector.set_collect_triangles(!self->m_useTlasBvh);
+
             // SAH BVH builds (flush) now happen in afterDraw() on the main thread —
             // not here — to avoid stalling the render worker for up to kMaxBuildsPerFrame
             // builds (which caused multi-second freezes when entering new areas).

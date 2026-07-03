@@ -74,6 +74,14 @@ public:
     // A good default is 3× the AO ray length.  Pass 0 to disable.
     void set_max_edge_length(float len) { m_maxEdgeLen = len; }
 
+    // Enable/disable full triangle decode + collection in process_draw().
+    // In BLAS/TLAS mode the decoded triangles feed nothing — instances come from
+    // the draw callback (BlasCache) and camera/texture capture happens before the
+    // decode — so collection is disabled to skip the per-draw decode/cull/subdivide
+    // cost on the main thread.  A pending OBJ dump forces collection back on until
+    // a frame's triangles have been written (see request_dump()).
+    void set_collect_triangles(bool v) { m_collectTriangles = v; }
+
     // Optional per-draw callback, fired for each qualifying draw call after the
     // projection/viewport/skybox filters.  Used to feed the BLAS cache without
     // introducing a webgpu header dependency into the test-linked geometry collector.
@@ -110,7 +118,9 @@ private:
     CameraData  m_pendingCameraData;
     CameraData  m_lastCameraData;
 
-    bool  m_pendingTriClear = false;
+    bool  m_pendingTriClear   = false;
+    bool  m_collectTriangles  = true;  // false in TLAS mode (decode skipped per draw)
+    bool  m_forceCollectFrame = false; // armed by request_dump() while collection is off
     bool  m_perspectiveOnly = true;
     float m_minViewportW    = 320.f;
     float m_minViewportH    = 240.f;

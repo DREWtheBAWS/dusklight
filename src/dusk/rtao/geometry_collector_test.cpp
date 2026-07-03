@@ -189,6 +189,39 @@ TEST_CASE("GeometryCollector: dump message includes triangle count") {
 }
 
 // ==========================================================================
+// TEST: collection gate skips decode; OBJ dump forces one collected frame
+// ==========================================================================
+TEST_CASE("GeometryCollector: set_collect_triangles(false) skips decode, dump forces a frame") {
+    GeometryCollector gc;
+    gc.set_collect_triangles(false);
+
+    std::vector<uint8_t> v; std::vector<uint16_t> idx;
+    gc.simulate_draw(make_triangle_draw(v, idx, 0,0,0, 1,0,0, 0,1,0));
+    gc.end_frame();
+    CHECK(gc.last_stats().triangleCount == 0); // decode skipped
+    CHECK(gc.last_stats().drawCallCount == 1); // draw still counted (filters/camera ran)
+
+    // Dump request arms one-shot collection; the write defers to the next
+    // collected frame because this frame's draws already ran.
+    const auto tmpPath = (std::filesystem::temp_directory_path() / "rtao_gate.obj").string();
+    gc.request_dump(tmpPath);
+    gc.end_frame();
+    CHECK(gc.last_dump_message().empty()); // nothing collected yet — deferred
+
+    gc.simulate_draw(make_triangle_draw(v, idx, 0,0,0, 1,0,0, 0,1,0));
+    gc.end_frame();
+    CHECK(gc.last_stats().triangleCount == 1);
+    CHECK(gc.last_dump_message().find("Saved 1") != std::string::npos);
+
+    // Gate closes again after the dump frame.
+    gc.simulate_draw(make_triangle_draw(v, idx, 0,0,0, 1,0,0, 0,1,0));
+    gc.end_frame();
+    CHECK(gc.last_stats().triangleCount == 0);
+
+    std::filesystem::remove(tmpPath);
+}
+
+// ==========================================================================
 // TEST: raw_triangles() reflects captured geometry before end_frame clears
 // ==========================================================================
 TEST_CASE("GeometryCollector: raw_triangles returns captured geometry") {
