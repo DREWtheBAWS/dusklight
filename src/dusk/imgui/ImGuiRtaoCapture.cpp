@@ -390,7 +390,13 @@ void ImGuiMenuTools::ShowRtaoCaptureWindow() {
     // the frustum still have nearby geometry collected for occlusion.
     // Frustum margin: exactly the AO ray length — geometry more than one ray-length outside
     // the view frustum can never occlude a visible surface, so discard it.
-    m_bvhBuilder.set_morton_range(s_maxDist * 4.f);
+    // Skinned (dynamic) range gets a floor of the shadow ray distance so
+    // characters keep casting shadows regardless of camera distance.
+    {
+        const float dynRange = std::max(s_maxDist * 4.f, s_shadowMaxDist);
+        m_bvhBuilder.set_morton_range(dynRange);
+        m_blasCache.set_max_distance(dynRange);
+    }
     m_collector.set_max_distance(s_maxDist * 4.f);
     m_collector.set_frustum_margin(s_maxDist);
     // Skip triangles with any edge longer than 3× the AO ray length: these are

@@ -146,8 +146,12 @@ namespace dusk {
                 m_collector.set_max_distance(dist * 4.f);
                 m_collector.set_frustum_margin(dist);
                 m_collector.set_max_edge_length(dist * 3.f);
-                m_bvhBuilder.set_morton_range(dist * 4.f);
-                m_blasCache.set_max_distance(dist * 4.f);
+                // Skinned (dynamic) range must cover shadow casters, not just the
+                // AO radius: at dist*4 (~400u) Link sat right at the cutoff and
+                // his triangles flickered in/out of the LBVH with camera drift.
+                const float dynRange = std::max(dist * 4.f, 3000.f);
+                m_bvhBuilder.set_morton_range(dynRange);
+                m_blasCache.set_max_distance(dynRange);
             }
             m_collector.set_collect_triangles(!m_useTlasBvh);
 

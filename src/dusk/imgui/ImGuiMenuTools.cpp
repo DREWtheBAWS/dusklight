@@ -70,9 +70,11 @@ namespace dusk {
 
             dusk::rtao::GeometryCollector::CameraData camData;
             bool dynUploaded = false;
+            size_t dynSnapCount = 0;
             {
                 std::lock_guard rtLock(self->m_rtPrepMutex);
                 camData = self->m_camSnapshot;
+                dynSnapCount = self->m_dynTrisSnapshot.size();
                 // Upload the TLAS built in afterDraw() (same lock generation as camData).
                 self->m_tlasBuilder.flush(device);
                 if (self->m_useTlasBvh && !self->m_dynTrisSnapshot.empty()) {

@@ -744,6 +744,10 @@ fn blas_ray_tri_hit(origin: vec3<f32>, dir: vec3<f32>, tri: BlasTri, tmax: f32) 
 // Returns 0=miss, 1=hit, 2=blas-visit-limit reached.
 const kMaxTlasVisits: u32 = 1024u;  // TLAS-level node budget per ray
 const kMaxBlasVisits: u32 = 2048u;  // per-BLAS node budget (each leaf capped separately)
+// The dynamic (skinned) LBVH degenerates when small triangles share Morton codes
+// (deep tie-broken chains), so its traversal needs far more headroom than the
+// SAH-built BLAS trees — an exhausted budget shows as flickering shadows/AO.
+const kMaxDynVisits: u32 = 8192u;
 
 fn traverse_blas(inst: TlasInstance, l_origin: vec3<f32>, l_dir: vec3<f32>,
                  tmax: f32, heat_acc: ptr<function, u32>) -> u32 {
@@ -808,11 +812,11 @@ fn traverse_dyn_lbvh(origin: vec3<f32>, dir: vec3<f32>, tmax: f32,
                       heat_acc: ptr<function, u32>) -> u32 {
     if (cam.dyn_node_count == 0u) { return 0u; }
     let inv_dir = vec3<f32>(1.0/dir.x, 1.0/dir.y, 1.0/dir.z);
-    var stk: array<u32, 64>;
+    var stk: array<u32, 128>;
     var sp: i32 = 1; stk[0] = 0u;
     var visits: u32 = 0u;
     loop {
-        if (sp <= 0 || visits >= kMaxBlasVisits) { break; }
+        if (sp <= 0 || visits >= kMaxDynVisits) { break; }
         sp -= 1; visits += 1u;
         let idx  = stk[u32(sp)];
         let node = dyn_blas_nodes[idx];
@@ -824,14 +828,14 @@ fn traverse_dyn_lbvh(origin: vec3<f32>, dir: vec3<f32>, tmax: f32,
                 }
             }
         } else {
-            if (sp < 62) {
+            if (sp < 126) {
                 stk[u32(sp)] = node.right_child; sp += 1;
                 stk[u32(sp)] = node.left_child;  sp += 1;
             }
         }
     }
     *heat_acc += visits;
-    return select(0u, 2u, visits >= kMaxBlasVisits);
+    return select(0u, 2u, visits >= kMaxDynVisits);
 }
 
 // ---- Two-level TLAS traversal (world space at TLAS, view space at BLAS) ----
@@ -1435,9 +1439,11 @@ fn dyn_ray_tri_hit(origin: vec3<f32>, dir: vec3<f32>, tri: DynBlasTri, tmax: f32
     return (t > 1e-4 && t < tmax);
 }
 
+)" R"(
 // ---- BVH traversal ----------------------------------------------------------
 const kMaxTlasVisits: u32 = 1024u;
 const kMaxBlasVisits: u32 = 2048u;
+const kMaxDynVisits: u32 = 8192u;  // degenerate skinned LBVH needs extra headroom
 
 fn traverse_blas(inst: TlasInstance, l_origin: vec3<f32>, l_dir: vec3<f32>,
                  tmax: f32, heat_acc: ptr<function, u32>) -> u32 {
@@ -1467,11 +1473,11 @@ fn traverse_dyn_lbvh(origin: vec3<f32>, dir: vec3<f32>, tmax: f32,
                       heat_acc: ptr<function, u32>) -> u32 {
     if (cam.dyn_node_count == 0u) { return 0u; }
     let inv_dir = vec3<f32>(1.0/dir.x, 1.0/dir.y, 1.0/dir.z);
-    var stk: array<u32, 64>;
+    var stk: array<u32, 128>;
     var sp: i32 = 1; stk[0] = 0u;
     var visits: u32 = 0u;
     loop {
-        if (sp <= 0 || visits >= kMaxBlasVisits) { break; }
+        if (sp <= 0 || visits >= kMaxDynVisits) { break; }
         sp -= 1; visits += 1u;
         let idx  = stk[u32(sp)];
         let node = dyn_blas_nodes[idx];
@@ -1483,14 +1489,14 @@ fn traverse_dyn_lbvh(origin: vec3<f32>, dir: vec3<f32>, tmax: f32,
                 }
             }
         } else {
-            if (sp < 62) {
+            if (sp < 126) {
                 stk[u32(sp)] = node.right_child; sp += 1;
                 stk[u32(sp)] = node.left_child;  sp += 1;
             }
         }
     }
     *heat_acc += visits;
-    return select(0u, 2u, visits >= kMaxBlasVisits);
+    return select(0u, 2u, visits >= kMaxDynVisits);
 }
 
 fn intersects_any(origin_view: vec3<f32>, dir_view: vec3<f32>, tmax: f32,

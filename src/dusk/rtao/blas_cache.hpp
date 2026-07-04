@@ -123,7 +123,7 @@ public:
     static constexpr uint32_t kEvictAfterFrames  = 300;   // ~5 s at 60 fps — reduces re-eviction churn when panning
     static constexpr uint32_t kMaxEntries        = 2048;  // bounds monolithic buffer size (~16 MB); the full world geometry is captured post-merge
     static constexpr uint32_t kMaxBuildsPerFrame = 16;    // runs on main thread in afterDraw(); keep per-frame budget small
-    static constexpr uint32_t kMaxDynTris        = 12000; // cap on accumulated skinned-mesh tris
+    static constexpr uint32_t kMaxDynTris        = 24000; // cap on accumulated skinned-mesh tris (radius now covers shadow casters)
 
 private:
     struct Pending {
