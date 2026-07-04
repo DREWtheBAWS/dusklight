@@ -25,14 +25,6 @@ public:
 
     void set_params(const Params& p) { m_params = p; }
 
-    // Run the AO compute pass using the GPU LBVH (single-level BVH, view space).
-    // nodeBuf and triBuf come from GpuBvhBuilder each frame.
-    void execute(WGPUDevice device, WGPUCommandEncoder encoder,
-                 WGPUTexture depthTex,
-                 const GeometryCollector::CameraData& cam,
-                 WGPUBuffer nodeBuf, WGPUBuffer triBuf,
-                 const std::vector<void*>& texViews);
-
     // Run the AO compute pass using the BLAS/TLAS two-level BVH (static geometry) plus
     // an optional GPU LBVH for dynamic (skinned) geometry in view space.
     // dynNodeBuf/dynTriBuf may be null when there is no skinned geometry this frame;
@@ -75,23 +67,14 @@ public:
     }
 
 private:
-    void ensure_pipeline(WGPUDevice device);
     void ensure_tlas_pipeline(WGPUDevice device);
     void ensure_shadow_pipeline(WGPUDevice device);
     void rebuild_output(WGPUDevice device, uint32_t w, uint32_t h);
     void rebuild_depth_binding(WGPUDevice device, WGPUTexture depthTex);
-    void rebuild_bind_group(WGPUDevice device);
     void rebuild_tlas_bind_group(WGPUDevice device);
     void rebuild_shadow_bind_group(WGPUDevice device);
 
     Params m_params{};
-
-    WGPUComputePipeline m_pipeline = nullptr;
-    WGPUBindGroupLayout m_bgl      = nullptr;
-
-    // Externally owned BVH buffers (from GpuBvhBuilder, not released here)
-    WGPUBuffer m_lastNodeBuf = nullptr;
-    WGPUBuffer m_lastTriBuf  = nullptr;
 
     WGPUBuffer m_cameraUbo = nullptr;
 
@@ -102,9 +85,6 @@ private:
 
     WGPUTextureView m_depthView    = nullptr;
     WGPUTexture     m_lastDepthTex = nullptr;
-
-    WGPUBindGroup m_bindGroup      = nullptr;
-    bool          m_bindGroupDirty = true;
 
     // TLAS/BLAS AO path — separate pipeline + bind group
     WGPUComputePipeline m_tlasPipeline           = nullptr;

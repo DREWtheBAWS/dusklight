@@ -71,10 +71,6 @@ namespace dusk {
 
         bool  m_showRtaoCapture   = false;
         bool  m_captureInstalled  = false; // true once install() has been called
-        bool  m_buildBvhOnly    = false;  // debug: skip AO pass after BVH build
-        bool  m_bvhFrozen       = false;  // debug: stop rebuilding BVH each frame
-        bool  m_bvhCaptureOnce  = false;  // debug: do one rebuild then auto-freeze
-        bool  m_useTlasBvh      = true;   // false=LBVH path, true=BLAS/TLAS path
         bool  m_excludeSkinned  = false;  // debug: skip dynamic LBVH for skinned meshes
         bool     m_aoEnabled          = true;   // apply composite pass to the EFB
         float    m_aoStrength         = 1.0f;   // [0,1] blend factor for AO composite

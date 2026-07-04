@@ -138,10 +138,7 @@ namespace dusk {
                 const int iters = getSettings().game.rtaoDenoiserIterations.getValue();
                 m_denoiseIterations = iters;
                 m_denoiseEnabled = (iters > 0);
-                m_useTlasBvh   = true;
                 m_aoEnabled    = true;
-                m_buildBvhOnly = false;
-                m_bvhFrozen    = false;
                 m_tlasBuilder.set_force_rebuild(false);
                 m_collector.set_max_distance(dist * 4.f);
                 m_collector.set_frustum_margin(dist);
@@ -153,7 +150,9 @@ namespace dusk {
                 m_bvhBuilder.set_morton_range(dynRange);
                 m_blasCache.set_max_distance(dynRange);
             }
-            m_collector.set_collect_triangles(!m_useTlasBvh);
+            // Triangle collection stays off: instances come from the BlasCache
+            // callback; OBJ dumps force one collected frame via request_dump().
+            m_collector.set_collect_triangles(false);
 
             // The camera snapshot and the TLAS both embed this frame's view
             // matrix; the render worker must never see one without the other,
@@ -205,7 +204,7 @@ namespace dusk {
             m_tlasBuilder.build(m_blasCache, m_camSnapshot.view);
 
             // Copy the skinned triangles for the render worker's GPU LBVH build.
-            if (m_useTlasBvh && !m_excludeSkinned) {
+            if (!m_excludeSkinned) {
                 m_dynTrisSnapshot = m_blasCache.dynamic_triangles();
             } else {
                 m_dynTrisSnapshot.clear();

@@ -40,10 +40,8 @@ void ImGuiMenuTools::ShowRtaoCaptureWindow() {
     }
 
     const auto stats = m_collector.last_stats();
-    if (m_useTlasBvh)
-        ImGui::Text("Triangles (last frame): %u (collection off - TLAS mode)", stats.triangleCount);
-    else
-        ImGui::Text("Triangles (last frame): %u", stats.triangleCount);
+    ImGui::Text("Triangles (last frame): %u (collection off; OBJ dump forces one frame)",
+                stats.triangleCount);
     ImGui::Text("Draw calls (last frame): %u", stats.drawCallCount);
     ImGui::Text("BLAS callback fired (ever): %u", m_collector.draw_callback_fired_total());
     ImGui::Text("Alpha textures: %u / %u total", static_cast<uint32_t>(m_collector.texture_views().size()),
@@ -109,24 +107,8 @@ void ImGuiMenuTools::ShowRtaoCaptureWindow() {
 
     ImGui::Separator();
 
-    // BVH path selection
-    ImGui::Checkbox("BLAS/TLAS (Phase 3)", &m_useTlasBvh);
-    ImGui::SameLine();
-    ImGui::TextDisabled(m_useTlasBvh ? "| two-level, opaque-only" : "| single-level LBVH + alpha");
-
-    ImGui::Separator();
-
-    // GPU BVH controls
-    ImGui::Checkbox("Build only (skip AO)", &m_buildBvhOnly);
-    ImGui::SameLine();
-    ImGui::Checkbox("Freeze BVH", &m_bvhFrozen);
-    ImGui::SameLine();
-    if (ImGui::Button("Capture & Freeze")) {
-        // do exactly one BVH rebuild on the next frame, then lock it
-        m_bvhFrozen      = false;
-        m_bvhCaptureOnce = true;
-    }
-    if (m_bvhFrozen) { ImGui::SameLine(); ImGui::TextDisabled("(frozen)"); }
+    // Dynamic (skinned) GPU LBVH stats — static geometry uses the BLAS/TLAS below.
+    ImGui::TextDisabled("Dynamic LBVH (skinned)");
     const auto bvhStats = m_bvhBuilder.last_stats();
     if (bvhStats.nodeCount > 0) {
         ImGui::Text("%u nodes, %u tris, %.2f ms", bvhStats.nodeCount, bvhStats.triCount, bvhStats.buildMs);
@@ -219,16 +201,14 @@ void ImGuiMenuTools::ShowRtaoCaptureWindow() {
     ImGui::Separator();
     ImGui::TextDisabled("Pipeline Validation");
 
-    // Stage 1 — GeometryCollector.  In TLAS mode triangle collection is disabled
-    // by design (instances flow through the BlasCache callback), so judge by
-    // draw calls seen instead of triangles collected.
+    // Stage 1 — GeometryCollector.  Triangle collection is disabled by design
+    // (instances flow through the BlasCache callback), so judge by draw calls.
     {
-        const bool ok1 = m_useTlasBvh ? stats.drawCallCount > 0 : stats.triangleCount > 0;
+        const bool ok1 = stats.drawCallCount > 0;
         ImGui::TextColored(ok1 ? ImVec4(0.3f,1.f,0.3f,1.f) : ImVec4(1.f,0.3f,0.3f,1.f),
             "Stage 1 GeoCollect: %s", ok1 ? "OK" : "FAIL");
         ImGui::SameLine(); ImGui::TextDisabled("(%u tris, %u draws)", stats.triangleCount, stats.drawCallCount);
-        if (!ok1) ImGui::TextWrapped("  Expected: >0 %s. Check install() called and game is running.",
-                                     m_useTlasBvh ? "draw calls" : "tris");
+        if (!ok1) ImGui::TextWrapped("  Expected: >0 draw calls. Check install() called and game is running.");
     }
     // Stage 2 — BlasCache record_draw
     {

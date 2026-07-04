@@ -77,7 +77,7 @@ namespace dusk {
                 dynSnapCount = self->m_dynTrisSnapshot.size();
                 // Upload the TLAS built in afterDraw() (same lock generation as camData).
                 self->m_tlasBuilder.flush(device);
-                if (self->m_useTlasBvh && !self->m_dynTrisSnapshot.empty()) {
+                if (!self->m_dynTrisSnapshot.empty()) {
                     self->m_bvhBuilder.upload_triangles(device, self->m_dynTrisSnapshot);
                     dynUploaded = true;
                 }
@@ -86,52 +86,28 @@ namespace dusk {
                 return;
             }
 
-            if (!self->m_useTlasBvh) {
-                // Original single-level LBVH path (debug only; reads live collector
-                // state and can race with the main thread — removed in Phase 2).
-                const bool doRebuild = !self->m_bvhFrozen || self->m_bvhCaptureOnce;
-                if (doRebuild) {
-                    const auto& tris = self->m_collector.raw_triangles();
-                    if (!tris.empty()) {
-                        self->m_bvhBuilder.upload_triangles(device, tris);
-                        self->m_bvhBuilder.build(device, encoder);
-                        if (self->m_bvhCaptureOnce) {
-                            self->m_bvhFrozen      = true;
-                            self->m_bvhCaptureOnce = false;
-                        }
-                    }
-                }
-            } else if (dynUploaded) {
-                // TLAS mode: GPU LBVH for skinned (multi-matrix) geometry only, from
-                // the snapshot copied in afterDraw().
+            // GPU LBVH for skinned (multi-matrix) geometry, from the snapshot
+            // copied in afterDraw().  Static geometry traces via the BLAS/TLAS.
+            if (dynUploaded) {
                 self->m_bvhBuilder.build(device, encoder);
             }
 
-            // AO pass: choose LBVH or BLAS/TLAS based on user toggle.
             WGPUTexture depthTex = aurora_get_depth_texture();
             const auto& texViews = self->m_collector.texture_views();
-            if (!self->m_buildBvhOnly) {
-                if (self->m_useTlasBvh && self->m_tlasBuilder.is_ready()) {
-                    const bool dynReady = dynUploaded && self->m_bvhBuilder.is_ready();
-                    self->m_aoPass.execute_tlas(device, encoder, depthTex, camData,
-                                                self->m_tlasBuilder.tlas_node_buf(),
-                                                self->m_tlasBuilder.instance_buf(),
-                                                self->m_tlasBuilder.blas_node_buf(),
-                                                self->m_tlasBuilder.blas_tri_buf(),
-                                                dynReady ? self->m_bvhBuilder.node_buf() : nullptr,
-                                                dynReady ? self->m_bvhBuilder.tri_buf()  : nullptr,
-                                                dynReady ? self->m_bvhBuilder.last_stats().nodeCount : 0u,
-                                                texViews);
-                } else if (self->m_bvhBuilder.is_ready()) {
-                    self->m_aoPass.execute(device, encoder, depthTex, camData,
-                                           self->m_bvhBuilder.node_buf(),
-                                           self->m_bvhBuilder.tri_buf(),
-                                           texViews);
-                }
+            if (self->m_tlasBuilder.is_ready()) {
+                const bool dynReady = dynUploaded && self->m_bvhBuilder.is_ready();
+                self->m_aoPass.execute_tlas(device, encoder, depthTex, camData,
+                                            self->m_tlasBuilder.tlas_node_buf(),
+                                            self->m_tlasBuilder.instance_buf(),
+                                            self->m_tlasBuilder.blas_node_buf(),
+                                            self->m_tlasBuilder.blas_tri_buf(),
+                                            dynReady ? self->m_bvhBuilder.node_buf() : nullptr,
+                                            dynReady ? self->m_bvhBuilder.tri_buf()  : nullptr,
+                                            dynReady ? self->m_bvhBuilder.last_stats().nodeCount : 0u,
+                                            texViews);
 
                 // Shadow pass: one ray per pixel toward the sun/light source.
-                if (self->m_shadowEnabled && self->m_useTlasBvh && self->m_tlasBuilder.is_ready()) {
-                    const bool dynReady = dynUploaded && self->m_bvhBuilder.is_ready();
+                if (self->m_shadowEnabled) {
                     self->m_aoPass.execute_shadow_tlas(device, encoder, depthTex, camData,
                                                        self->m_tlasBuilder.tlas_node_buf(),
                                                        self->m_tlasBuilder.instance_buf(),
