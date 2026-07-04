@@ -3,6 +3,7 @@
 #include <aurora/geometry_capture.h>
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 
 namespace dusk::rtao {
 

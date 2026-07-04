@@ -512,10 +512,10 @@ void TlasBuilder::flush(WGPUDevice device) {
 
     // Upload TLAS nodes + instance table based on which dirty flags are set.
     if (m_tlasNodesDirty) {
-        // Full rebuild: recreate both buffers.
-        release_buf(m_tlasNodeBuf);
-        release_buf(m_instanceBuf);
-
+        // Full rebuild.  Reuse the existing buffers whenever capacity allows:
+        // while the world streams in the TLAS rebuilds every frame, and
+        // releasing/recreating buffers made is_ready() flicker and forced a
+        // bind-group rebuild in AoPass each frame.
         if (!m_tlasNodes.empty()) {
             // Pack and upload TLAS nodes.
             {
@@ -530,7 +530,18 @@ void TlasBuilder::flush(WGPUDevice device) {
                     g.tri_offset =n.tri_offset;   g.tri_count  =n.tri_count;
                     g._pad[0]=0; g._pad[1]=0;
                 }
-                m_tlasNodeBuf = upload_gpu(device, gpu.data(), gpu.size()*sizeof(BlasCache::GpuNode));
+                const uint32_t count = static_cast<uint32_t>(gpu.size());
+                if (!m_tlasNodeBuf || count > m_tlasNodeBufCap) {
+                    release_buf(m_tlasNodeBuf);
+                    const uint32_t cap = count + count / 2 + 64;
+                    WGPUBufferDescriptor d{};
+                    d.size  = uint64_t(cap) * sizeof(BlasCache::GpuNode);
+                    d.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
+                    m_tlasNodeBuf    = wgpuDeviceCreateBuffer(device, &d);
+                    m_tlasNodeBufCap = cap;
+                }
+                wgpuQueueWriteBuffer(aurora_get_queue(), m_tlasNodeBuf, 0,
+                                     gpu.data(), count * sizeof(BlasCache::GpuNode));
             }
 
             // Pack and upload instance table.
@@ -545,8 +556,18 @@ void TlasBuilder::flush(WGPUDevice device) {
                     gi.blasNodeCount  = ci.blasNodeCount;
                     gi.blasTriCount   = ci.blasTriCount;
                 }
-                m_instanceBuf    = upload_gpu(device, gpu.data(), gpu.size()*sizeof(GpuTlasInstance));
-                m_instanceBufCap = static_cast<uint32_t>(m_instances.size());
+                const uint32_t count = static_cast<uint32_t>(gpu.size());
+                if (!m_instanceBuf || count > m_instanceBufCap) {
+                    release_buf(m_instanceBuf);
+                    const uint32_t cap = count + count / 2 + 64;
+                    WGPUBufferDescriptor d{};
+                    d.size  = uint64_t(cap) * sizeof(GpuTlasInstance);
+                    d.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
+                    m_instanceBuf    = wgpuDeviceCreateBuffer(device, &d);
+                    m_instanceBufCap = cap;
+                }
+                wgpuQueueWriteBuffer(aurora_get_queue(), m_instanceBuf, 0,
+                                     gpu.data(), count * sizeof(GpuTlasInstance));
             }
         }
     } else if (m_tlasInstDirty) {

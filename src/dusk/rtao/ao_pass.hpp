@@ -15,6 +15,10 @@ public:
         uint32_t debugMode       = 0;   // 0=AO, 1=normals, 2=depth, 3=root-AABB
         uint32_t debugMode2      = 0;   // 0=limit-hits,1=AO,2=normals,3=depth,4=root-AABB,5=visit-heat,6=limit%
         float    shadowConeRadius = 0.02f; // half-angle (radians) of the sun disk for soft shadows
+        // Shadow rays need far longer reach than AO rays: sun occluders (hills,
+        // buildings) sit hundreds-thousands of units away along the light
+        // direction, while AO only samples nearby geometry.
+        float    shadowMaxDistance = 3000.f;
     };
 
     ~AoPass();

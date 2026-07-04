@@ -2,6 +2,7 @@
 #include "imgui.h"
 #include "misc/cpp/imgui_stdlib.h"
 #include "d/d_kankyo.h"
+#include "dusk/settings.h"
 #include <SDL3/SDL_filesystem.h>
 #include <algorithm>
 #include <array>
@@ -15,6 +16,23 @@ namespace dusk {
 
 void ImGuiMenuTools::ShowRtaoCaptureWindow() {
     if (!m_showRtaoCapture) return;
+
+    // First open: seed the debug controls from the persistent settings so the
+    // window starts from what the player actually sees.  Without this the
+    // member defaults apply (notably m_shadowStrength = 0), silently disabling
+    // the RT shadow composite whenever the window is open.
+    {
+        static bool s_synced = false;
+        if (!s_synced) {
+            s_synced = true;
+            m_aoStrength     = getSettings().game.rtaoIntensity.getValue();
+            m_shadowEnabled  = getSettings().game.rtShadowEnabled.getValue();
+            m_shadowStrength = getSettings().game.rtShadowIntensity.getValue();
+            const int iters  = getSettings().game.rtaoDenoiserIterations.getValue();
+            m_denoiseIterations = iters;
+            m_denoiseEnabled    = (iters > 0);
+        }
+    }
 
     if (!ImGui::Begin("RTAO Capture", &m_showRtaoCapture)) {
         ImGui::End();
@@ -201,13 +219,16 @@ void ImGuiMenuTools::ShowRtaoCaptureWindow() {
     ImGui::Separator();
     ImGui::TextDisabled("Pipeline Validation");
 
-    // Stage 1 — GeometryCollector
+    // Stage 1 — GeometryCollector.  In TLAS mode triangle collection is disabled
+    // by design (instances flow through the BlasCache callback), so judge by
+    // draw calls seen instead of triangles collected.
     {
-        const bool ok1 = stats.triangleCount > 0;
+        const bool ok1 = m_useTlasBvh ? stats.drawCallCount > 0 : stats.triangleCount > 0;
         ImGui::TextColored(ok1 ? ImVec4(0.3f,1.f,0.3f,1.f) : ImVec4(1.f,0.3f,0.3f,1.f),
             "Stage 1 GeoCollect: %s", ok1 ? "OK" : "FAIL");
         ImGui::SameLine(); ImGui::TextDisabled("(%u tris, %u draws)", stats.triangleCount, stats.drawCallCount);
-        if (!ok1) ImGui::TextWrapped("  Expected: >0 tris. Check install() called and game is running.");
+        if (!ok1) ImGui::TextWrapped("  Expected: >0 %s. Check install() called and game is running.",
+                                     m_useTlasBvh ? "draw calls" : "tris");
     }
     // Stage 2 — BlasCache record_draw
     {
@@ -337,7 +358,10 @@ void ImGuiMenuTools::ShowRtaoCaptureWindow() {
     ImGui::Separator();
 
     // AO params
-    static int   s_raysPerPixel = 1;
+    // Default 8 to match settings quality "high": with 1 ray the shadow value is
+    // binary per pixel — no penumbra exists and the edge-aware denoiser preserves
+    // the hard step, making the sun-cone slider appear to do nothing.
+    static int   s_raysPerPixel = 8;
     static float s_maxDist      = 500.f;
     static float s_normalBias   = 0.01f;
     static int   s_debugMode    = 0;
@@ -357,10 +381,11 @@ void ImGuiMenuTools::ShowRtaoCaptureWindow() {
     ImGui::SetNextItemWidth(180.f);
     ImGui::Combo("Right panel", &s_debugMode2, "Limit Hits\0AO\0Normals\0Depth dist\0Root AABB\0Visit Heat\0Limit %\0");
     static float s_shadowConeRadius = 0.02f;
+    static float s_shadowMaxDist    = 3000.f;
     m_aoPass.set_params({static_cast<uint32_t>(s_raysPerPixel), s_maxDist, s_normalBias,
                          static_cast<uint32_t>(s_debugMode),
                          static_cast<uint32_t>(s_debugMode2),
-                         s_shadowConeRadius});
+                         s_shadowConeRadius, s_shadowMaxDist});
     // Geometry sphere radius: 4× the AO ray length ensures surfaces at the far end of
     // the frustum still have nearby geometry collected for occlusion.
     // Frustum margin: exactly the AO ray length — geometry more than one ray-length outside
@@ -514,6 +539,9 @@ void ImGuiMenuTools::ShowRtaoCaptureWindow() {
     // Sun cone radius: half-angle (radians) of the sun disk. Larger = wider, softer penumbra.
     // 0.01 rad (~0.6 deg) = sharp sun-like shadows; 0.1 rad (~6 deg) = very soft.
     ImGui::SliderFloat("Sun cone##shadow", &s_shadowConeRadius, 0.0f, 0.3f, "%.3f rad");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(160.f);
+    ImGui::SliderFloat("Ray dist##shadow", &s_shadowMaxDist, 100.f, 10000.f, "%.0f");
     ImGui::EndDisabled();
 
     // Light position diagnostics.

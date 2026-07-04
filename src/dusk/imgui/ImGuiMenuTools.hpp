@@ -2,6 +2,7 @@
 #define DUSK_IMGUI_MENUTOOLS_HPP
 
 #include <aurora/aurora.h>
+#include <mutex>
 #include <queue>
 #include <string>
 
@@ -85,6 +86,16 @@ namespace dusk {
         int      m_denoiseIterations  = 4;
         float    m_denoiseSigmaZ      = 1.0f;
         float    m_denoiseSigmaL      = 1.0f;
+        // Main-thread snapshots taken in afterDraw() once the frame's draws are
+        // complete.  The pre-UI callback runs on the render worker concurrently
+        // with the NEXT frame's draws on the main thread, so it must not read
+        // live collector/cache state — only these snapshots, and only under
+        // m_rtPrepMutex.  The mutex also bundles the camera snapshot with the
+        // matching TLAS state: both embed the view matrix, so mixing frames
+        // breaks ray transforms (visible as an all-red root-AABB debug view).
+        std::mutex                                m_rtPrepMutex;
+        dusk::rtao::GeometryCollector::CameraData m_camSnapshot{};
+        std::vector<dusk::rtao::Triangle>         m_dynTrisSnapshot;
         dusk::rtao::BlasCache          m_blasCache;   // declared before m_collector (callback sets up pointer)
         dusk::rtao::TlasBuilder        m_tlasBuilder;
         dusk::rtao::GeometryCollector  m_collector;

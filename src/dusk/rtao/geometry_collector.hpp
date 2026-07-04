@@ -137,6 +137,11 @@ private:
     void*        m_drawCbUserdata = nullptr;
     uint32_t     m_drawCbFiredTotal = 0;
 
+    // Mid-frame camera switch detection (reflection pre-pass → main camera).
+    float    m_switchCandidatePos[3] = {};
+    uint32_t m_switchCandidateCount  = 0;
+    static constexpr uint32_t kCameraSwitchThreshold = 5;
+
     static constexpr uint32_t kMaxTriangles = 500'000;
     static constexpr uint32_t kMaxTexSlots  = 16;
 };

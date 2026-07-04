@@ -121,7 +121,7 @@ public:
     // Per-frame build budget: limits per-frame CPU cost while new areas are explored.
     // After kMaxEntries BLASes are cached the queue drains and subsequent frames are free.
     static constexpr uint32_t kEvictAfterFrames  = 300;   // ~5 s at 60 fps — reduces re-eviction churn when panning
-    static constexpr uint32_t kMaxEntries        = 1024;  // bounds monolithic buffer size (~8 MB); covers large outdoor scenes
+    static constexpr uint32_t kMaxEntries        = 2048;  // bounds monolithic buffer size (~16 MB); the full world geometry is captured post-merge
     static constexpr uint32_t kMaxBuildsPerFrame = 16;    // runs on main thread in afterDraw(); keep per-frame budget small
     static constexpr uint32_t kMaxDynTris        = 12000; // cap on accumulated skinned-mesh tris
 

@@ -45,6 +45,7 @@ static AuroraGxCaptureDraw make_triangle_draw(std::vector<uint8_t>& verts,
     // pnMtx translation is zero (skybox filter), so tests must look like real geometry.
     d.pnMtx[0][0][0] = 1.f; d.pnMtx[0][1][1] = 1.f; d.pnMtx[0][2][2] = 1.f;
     d.pnMtx[0][2][3] = -100.f;
+    d.depthWrite = 1; // collector skips non-depth-writing draws (sky/effects)
     d.indices        = indices.data();
     d.indexCount     = 3;
     d.projType       = 0;    // GX_PERSPECTIVE
@@ -138,6 +139,7 @@ TEST_CASE("GeometryCollector: OBJ dump produces valid vertex and face lines") {
         d.currentPnMtx = 0;
         d.pnMtx[0][0][0] = 1.f; d.pnMtx[0][1][1] = 1.f; d.pnMtx[0][2][2] = 1.f;
         d.pnMtx[0][2][3] = -100.f; // pass the skybox (zero-translation) filter
+        d.depthWrite = 1;          // pass the non-depth-writing (sky/effects) filter
         d.indices = idx.data(); d.indexCount = 6;
         d.projType = 0; d.viewportWidth = 640.f; d.viewportHeight = 480.f;
         return d;

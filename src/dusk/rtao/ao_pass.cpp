@@ -2129,7 +2129,7 @@ void AoPass::execute_shadow_tlas(WGPUDevice device, WGPUCommandEncoder encoder,
     gpuCam.raysPerPixel     = m_params.raysPerPixel;
     gpuCam.frameSeed        = m_frame++;
     gpuCam.normalBias       = m_params.normalBias;
-    gpuCam.maxDistance      = m_params.maxDistance;  // caps tmax to avoid skybox hits
+    gpuCam.maxDistance      = m_params.shadowMaxDistance;  // caps tmax to avoid skybox hits
     gpuCam.shadowConeRadius = m_params.shadowConeRadius;
     gpuCam.dynNodeCount     = dynNodeCount;
     if (!compute_inv_proj(cam, gpuCam.invViewProj)) return;

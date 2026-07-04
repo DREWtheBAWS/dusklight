@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <aurora/lib/internal.hpp>
 #include <SDL3/SDL_misc.h>
 
@@ -55,86 +56,37 @@ namespace dusk {
             ScopeMsStore preUiTimer{std::chrono::high_resolution_clock::now(), self->m_preUiMs};
             self->m_rtEncodeMs = 0.f; // stays 0 on the early-return paths below
 
-            // Determine whether geometry capture and RT work are needed this frame.
-            const bool rtaoNeeded = self->m_showRtaoCapture ||
-                                    getSettings().game.rtaoEnabled.getValue();
-
-            // Install or uninstall the geometry capture callback based on need.
-            // Called from render worker — safe because the main thread is blocked in
-            // acquire_frame_slot during the render worker's frame processing.
-            if (!rtaoNeeded) {
-                if (self->m_captureInstalled) {
-                    self->m_collector.uninstall();
-                    self->m_captureInstalled = false;
-                }
-                return;
-            }
+            // All CPU-side prep (capture install/uninstall, settings, camera snapshot,
+            // TLAS build, dynamic-triangle copy) happens in afterDraw() on the main
+            // thread, where frame state is complete and race-free.  This callback runs
+            // on the render worker — concurrently with the NEXT frame's draws — so it
+            // only encodes GPU work from the snapshots, taken under the RT prep mutex
+            // so the camera and TLAS always come from the same frame.
             if (!self->m_captureInstalled) {
-                self->m_collector.install();
-                self->m_captureInstalled = true;
-                // The draw calls for this frame already ran before preUICb fires.
-                // No geometry was captured yet — defer RT work to the next frame.
                 return;
             }
-
-            // When the debug capture window is not open, drive everything from persistent settings.
-            // The capture window overrides these each frame when it is visible.
-            if (!self->m_showRtaoCapture) {
-                const float dist = static_cast<float>(getSettings().game.rtaoRayLength.getValue());
-                static constexpr uint32_t kQualityRays[] = {1u, 4u, 8u};
-                const int q = std::clamp(getSettings().game.rtaoQuality.getValue(), 0, 2);
-                self->m_aoPass.set_params({kQualityRays[q], dist, 0.01f, 0u, 0u, 0.02f});
-                self->m_aoStrength     = getSettings().game.rtaoIntensity.getValue();
-                self->m_shadowEnabled  = getSettings().game.rtShadowEnabled.getValue();
-                self->m_shadowStrength = getSettings().game.rtShadowIntensity.getValue();
-                const int iters = getSettings().game.rtaoDenoiserIterations.getValue();
-                self->m_denoiseIterations = iters;
-                self->m_denoiseEnabled = (iters > 0);
-                self->m_useTlasBvh   = true;
-                self->m_aoEnabled    = true;
-                self->m_buildBvhOnly = false;
-                self->m_bvhFrozen    = false;
-                self->m_tlasBuilder.set_force_rebuild(false);
-                self->m_collector.set_max_distance(dist * 4.f);
-                self->m_collector.set_frustum_margin(dist);
-                self->m_collector.set_max_edge_length(dist * 3.f);
-                self->m_bvhBuilder.set_morton_range(dist * 4.f);
-                self->m_blasCache.set_max_distance(dist * 4.f);
-            }
-
-            // TLAS mode needs no decoded triangles: instances come from the BlasCache
-            // draw callback and camera/alpha-texture capture happens before the decode.
-            // Disabling collection skips the per-draw decode/cull/subdivide cost on the
-            // main thread (the dominant CPU cost of the capture callback).
-            self->m_collector.set_collect_triangles(!self->m_useTlasBvh);
-
-            // SAH BVH builds (flush) now happen in afterDraw() on the main thread —
-            // not here — to avoid stalling the render worker for up to kMaxBuildsPerFrame
-            // builds (which caused multi-second freezes when entering new areas).
-
-            // Use the game's actual sun light position (GX lighting source) for shadow direction.
-            // sun_light_pos is the world-space position GX uses for sun diffuse/specular — it's
-            // typically very far above the scene (directional-light approximation), which is what
-            // we want for casting sun shadows.  plight_near_pos is a nearby point light (torch,
-            // lamp) and causes rays to aim at the scene floor/origin, blocking everything.
-            const cXyz& lightPos = g_env_light.sun_light_pos;
-            self->m_collector.set_light_world_pos(lightPos.x, lightPos.y, lightPos.z);
-
-            // Camera data is needed for the world-space TLAS build and the AO/shadow passes.
-            const auto& camData  = self->m_collector.pending_camera_data();
 
             ScopeMsStore rtEncodeTimer{std::chrono::high_resolution_clock::now(), self->m_rtEncodeMs};
 
-            // Build the world-space TLAS over this frame's instances.
-            // Must run after m_blasCache.flush() so all BLAS entries are available.
-            self->m_tlasBuilder.build(self->m_blasCache, camData.view);
-            self->m_tlasBuilder.flush(device);
-
-            // Sync the exclude-skinned debug flag so TlasBuilder omits the dynamic instance.
-            self->m_tlasBuilder.set_exclude_skinned(self->m_excludeSkinned);
+            dusk::rtao::GeometryCollector::CameraData camData;
+            bool dynUploaded = false;
+            {
+                std::lock_guard rtLock(self->m_rtPrepMutex);
+                camData = self->m_camSnapshot;
+                // Upload the TLAS built in afterDraw() (same lock generation as camData).
+                self->m_tlasBuilder.flush(device);
+                if (self->m_useTlasBvh && !self->m_dynTrisSnapshot.empty()) {
+                    self->m_bvhBuilder.upload_triangles(device, self->m_dynTrisSnapshot);
+                    dynUploaded = true;
+                }
+            }
+            if (!camData.valid) {
+                return;
+            }
 
             if (!self->m_useTlasBvh) {
-                // Original single-level LBVH path (all captured geometry).
+                // Original single-level LBVH path (debug only; reads live collector
+                // state and can race with the main thread — removed in Phase 2).
                 const bool doRebuild = !self->m_bvhFrozen || self->m_bvhCaptureOnce;
                 if (doRebuild) {
                     const auto& tris = self->m_collector.raw_triangles();
@@ -147,15 +99,10 @@ namespace dusk {
                         }
                     }
                 }
-            } else if (!self->m_excludeSkinned) {
-                // TLAS mode: GPU LBVH for skinned (multi-matrix) geometry only.
-                // BlasCache separates multi-matrix draws into dynamic_triangles() and applies
-                // the same distance filter as the collector, so only in-range skinned tris reach here.
-                const auto& dynTris = self->m_blasCache.dynamic_triangles();
-                if (!dynTris.empty()) {
-                    self->m_bvhBuilder.upload_triangles(device, dynTris);
-                    self->m_bvhBuilder.build(device, encoder);
-                }
+            } else if (dynUploaded) {
+                // TLAS mode: GPU LBVH for skinned (multi-matrix) geometry only, from
+                // the snapshot copied in afterDraw().
+                self->m_bvhBuilder.build(device, encoder);
             }
 
             // AO pass: choose LBVH or BLAS/TLAS based on user toggle.
@@ -163,7 +110,7 @@ namespace dusk {
             const auto& texViews = self->m_collector.texture_views();
             if (!self->m_buildBvhOnly) {
                 if (self->m_useTlasBvh && self->m_tlasBuilder.is_ready()) {
-                    const bool dynReady = self->m_bvhBuilder.is_ready() && !self->m_excludeSkinned;
+                    const bool dynReady = dynUploaded && self->m_bvhBuilder.is_ready();
                     self->m_aoPass.execute_tlas(device, encoder, depthTex, camData,
                                                 self->m_tlasBuilder.tlas_node_buf(),
                                                 self->m_tlasBuilder.instance_buf(),
@@ -182,7 +129,7 @@ namespace dusk {
 
                 // Shadow pass: one ray per pixel toward the sun/light source.
                 if (self->m_shadowEnabled && self->m_useTlasBvh && self->m_tlasBuilder.is_ready()) {
-                    const bool dynReady = self->m_bvhBuilder.is_ready() && !self->m_excludeSkinned;
+                    const bool dynReady = dynUploaded && self->m_bvhBuilder.is_ready();
                     self->m_aoPass.execute_shadow_tlas(device, encoder, depthTex, camData,
                                                        self->m_tlasBuilder.tlas_node_buf(),
                                                        self->m_tlasBuilder.instance_buf(),

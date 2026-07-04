@@ -137,6 +137,7 @@ private:
 
     // Per-frame GPU buffers (uploaded each frame)
     WGPUBuffer m_tlasNodeBuf    = nullptr;
+    uint32_t   m_tlasNodeBufCap = 0;  // node count the current buffer was sized for
     WGPUBuffer m_instanceBuf    = nullptr;
     uint32_t   m_instanceBufCap = 0;  // instance count the current buffer was sized for
 

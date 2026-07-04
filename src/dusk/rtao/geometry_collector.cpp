@@ -1,6 +1,7 @@
 #include "geometry_collector.hpp"
 #include <aurora/geometry_capture.h>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 
@@ -71,6 +72,11 @@ void GeometryCollector::process_draw(const AuroraGxCaptureDraw* draw) {
     if (m_minViewportW > 0.f && draw->viewportWidth  < m_minViewportW) return;
     if (m_minViewportH > 0.f && draw->viewportHeight < m_minViewportH) return;
 
+    // Skip draws that don't write depth: sky domes, clouds, and most screen
+    // effects.  They are not solid geometry and must not occlude AO/shadow rays
+    // (a camera-centered sky dome otherwise puts the whole world in shadow).
+    if (!draw->depthWrite) return;
+
     // Skip skybox: its pnMtx is a pure rotation (translation column = 0) so the scene
     // rotates with the camera but never translates. Any real-geometry draw has a non-zero
     // translation because the camera is not at the world origin.
@@ -86,19 +92,64 @@ void GeometryCollector::process_draw(const AuroraGxCaptureDraw* draw) {
         ++m_drawCbFiredTotal;
     }
 
-    // Capture projection and view matrices from the first qualifying draw.
-    // GX slot 0 is loaded with the pure view matrix (world→view) before any object draws.
-    if (!m_pendingCameraData.valid) {
-        memcpy(m_pendingCameraData.proj, draw->projMtx, sizeof(m_pendingCameraData.proj));
+    // Capture projection and view matrices from qualifying draws.
+    // GX slot 0 is loaded with the pure view matrix (world→view) before any
+    // object draws.  Two filters guard against TP's mid-frame camera switches
+    // (water-reflection and screen-effect pre-passes render BEFORE the main
+    // scene at certain camera positions, and would otherwise poison the frame's
+    // camera — visible as an all-red root-AABB debug view at those spots):
+    //   1. det(R) must be > 0 and rows unit-length: rejects mirrored/sheared
+    //      matrices and object transforms in slot 0.
+    //   2. A different camera position is accepted only after
+    //      kCameraSwitchThreshold consecutive draws agree on it.  Reflection→
+    //      main transitions agree quickly; unrelated object matrices each give
+    //      a different position and never accumulate.
+    {
         const float (&vm)[3][4] = draw->pnMtx[0];
-        for (int r = 0; r < 3; ++r)
-            for (int c = 0; c < 4; ++c)
-                m_pendingCameraData.view[r][c] = vm[r][c];
-        m_pendingCameraData.view[3][0] = 0.f;
-        m_pendingCameraData.view[3][1] = 0.f;
-        m_pendingCameraData.view[3][2] = 0.f;
-        m_pendingCameraData.view[3][3] = 1.f;
-        m_pendingCameraData.valid = true;
+        const auto row_len2 = [&](int r) {
+            return vm[r][0]*vm[r][0] + vm[r][1]*vm[r][1] + vm[r][2]*vm[r][2];
+        };
+        const bool unitRows = std::abs(row_len2(0) - 1.f) < 0.01f &&
+                              std::abs(row_len2(1) - 1.f) < 0.01f &&
+                              std::abs(row_len2(2) - 1.f) < 0.01f;
+        const float det = vm[0][0]*(vm[1][1]*vm[2][2] - vm[1][2]*vm[2][1])
+                        - vm[0][1]*(vm[1][0]*vm[2][2] - vm[1][2]*vm[2][0])
+                        + vm[0][2]*(vm[1][0]*vm[2][1] - vm[1][1]*vm[2][0]);
+        if (unitRows && det > 0.f) {
+            // Camera world position: p = -R^T * t (R orthonormal).
+            float wp[3];
+            for (int i = 0; i < 3; ++i)
+                wp[i] = -(vm[0][i]*vm[0][3] + vm[1][i]*vm[1][3] + vm[2][i]*vm[2][3]);
+            const auto close = [](const float a[3], const float b[3]) {
+                const float dx = a[0]-b[0], dy = a[1]-b[1], dz = a[2]-b[2];
+                return dx*dx + dy*dy + dz*dz < 1.f; // same camera within 1 unit
+            };
+            const auto accept = [&] {
+                memcpy(m_pendingCameraData.proj, draw->projMtx, sizeof(m_pendingCameraData.proj));
+                for (int r = 0; r < 3; ++r)
+                    for (int c = 0; c < 4; ++c)
+                        m_pendingCameraData.view[r][c] = vm[r][c];
+                m_pendingCameraData.view[3][0] = 0.f;
+                m_pendingCameraData.view[3][1] = 0.f;
+                m_pendingCameraData.view[3][2] = 0.f;
+                m_pendingCameraData.view[3][3] = 1.f;
+                memcpy(m_pendingCameraData.worldPos, wp, sizeof(wp));
+                m_pendingCameraData.valid = true;
+                m_switchCandidateCount = 0;
+            };
+            if (!m_pendingCameraData.valid) {
+                accept();
+            } else if (!close(wp, m_pendingCameraData.worldPos)) {
+                if (m_switchCandidateCount > 0 && close(wp, m_switchCandidatePos)) {
+                    if (++m_switchCandidateCount >= kCameraSwitchThreshold) accept();
+                } else {
+                    memcpy(m_switchCandidatePos, wp, sizeof(wp));
+                    m_switchCandidateCount = 1;
+                }
+            } else {
+                m_switchCandidateCount = 0; // consistent with current camera
+            }
+        }
     }
 
     ++m_drawCallCount;
