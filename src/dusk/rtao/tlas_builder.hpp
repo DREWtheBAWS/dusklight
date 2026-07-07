@@ -14,7 +14,7 @@ namespace dusk::rtao {
 // TLAS leaf.  Produces four GPU buffers consumed by the Phase 3 AO shader:
 //
 //   tlas_node_buf  — BVH nodes over world-space AABBs (BvhNode / GpuNode format)
-//   instance_buf   — per-instance pnMtxInv + BLAS offsets (GpuTlasInstance)
+//   instance_buf   — per-instance worldToLocal + BLAS offsets (GpuTlasInstance)
 //   blas_node_buf  — monolithic BLAS node buffer (all cached BLASes concatenated)
 //   blas_tri_buf   — monolithic BLAS tri buffer
 //
@@ -24,9 +24,9 @@ namespace dusk::rtao {
 //   3. advance_frame()       — reset per-frame CPU state (from afterDraw)
 class TlasBuilder {
 public:
-    // 64 bytes — pnMtxInv for ray transform + offsets into monolithic buffers.
+    // 64 bytes — worldToLocal for ray transform + offsets into monolithic buffers.
     struct GpuTlasInstance {
-        float    pnMtxInv[3][4]; // view→local (BLAS rays are always in view space)
+        float    worldToLocal[3][4]; // world→local; camera-independent (view factors cancel)
         uint32_t blasNodeOffset; // first node index in monolithic blas_node_buf
         uint32_t blasTriOffset;  // first tri  index in monolithic blas_tri_buf
         uint32_t blasNodeCount;
@@ -47,7 +47,7 @@ public:
         float    buildMs;          // CPU time for build() this frame (ms)
         float    flushMs;          // CPU time for flush() this frame (ms)
         bool     cached;      // true when TLAS BVH nodes were reused (world-space geometry unchanged)
-        bool     instCached;  // true when instance buffer was also reused (pnMtxInv unchanged)
+        bool     instCached;  // true when instance buffer was also reused (worldToLocal unchanged)
     };
 
     // On-demand structural validation — run once per frame when m_validateNext is set.
@@ -106,7 +106,7 @@ private:
         AABB     worldAabb;
         AABB     localAabb;     // cached for fast-path worldAabb recompute without map lookup
         BlasKey  blasKey;       // cached for fast-path draw-source verification
-        float    pnMtxInv[3][4];
+        float    worldToLocal[3][4];
         uint32_t blasNodeOffset;
         uint32_t blasTriOffset;
         uint32_t blasNodeCount;
@@ -151,8 +151,9 @@ private:
     bool     m_excludeSkinned   = false; // debug: skip dynamic BLAS instance
     bool     m_forceRebuild     = false; // debug: always run full slow-path rebuild
 
-    // Split-hash caching: structural hash covers world-space AABBs + BLAS refs (camera-independent).
-    // Instance hash covers pnMtxInv (view-dependent — changes when camera moves).
+    // Split-hash caching: structural hash covers world-space AABBs + BLAS refs.
+    // Instance hash covers worldToLocal — both camera-independent, so pure camera
+    // motion re-uploads nothing.
     uint64_t m_lastStructHash   = 0;
     uint64_t m_lastInstHash     = 0;
     bool     m_tlasNodesDirty   = true;  // rebuild BVH nodes

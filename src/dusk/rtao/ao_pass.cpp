@@ -165,9 +165,9 @@ struct AcNode {
 
 // TlasInstance: 64 bytes, matches GpuTlasInstance on the CPU.
 struct TlasInstance {
-    pnMtxInv_r0     : vec4<f32>,   // offset 0   row 0 of view→local 3×4 matrix
-    pnMtxInv_r1     : vec4<f32>,   // offset 16  row 1
-    pnMtxInv_r2     : vec4<f32>,   // offset 32  row 2
+    wtl_r0     : vec4<f32>,   // offset 0   row 0 of view→local 3×4 matrix
+    wtl_r1     : vec4<f32>,   // offset 16  row 1
+    wtl_r2     : vec4<f32>,   // offset 32  row 2
     blas_node_offset: u32,          // offset 48  (informational, already baked into node indices)
     blas_tri_offset : u32,          // offset 52  (informational, already baked into tri_offset)
     blas_node_count : u32,          // offset 56
@@ -314,16 +314,16 @@ fn aabb_hit(node: AcNode, origin: vec3<f32>, inv_dir: vec3<f32>, tmax: f32) -> b
 // pnMtxInv is stored as three vec4 rows of a 3×4 affine matrix.
 fn xf_point(inst: TlasInstance, p: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(
-        dot(inst.pnMtxInv_r0, vec4<f32>(p, 1.0)),
-        dot(inst.pnMtxInv_r1, vec4<f32>(p, 1.0)),
-        dot(inst.pnMtxInv_r2, vec4<f32>(p, 1.0))
+        dot(inst.wtl_r0, vec4<f32>(p, 1.0)),
+        dot(inst.wtl_r1, vec4<f32>(p, 1.0)),
+        dot(inst.wtl_r2, vec4<f32>(p, 1.0))
     );
 }
 fn xf_dir(inst: TlasInstance, d: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(
-        dot(inst.pnMtxInv_r0.xyz, d),
-        dot(inst.pnMtxInv_r1.xyz, d),
-        dot(inst.pnMtxInv_r2.xyz, d)
+        dot(inst.wtl_r0.xyz, d),
+        dot(inst.wtl_r1.xyz, d),
+        dot(inst.wtl_r2.xyz, d)
     );
 }
 
@@ -453,7 +453,7 @@ fn traverse_dyn_lbvh(origin: vec3<f32>, dir: vec3<f32>, tmax: f32,
 // ---- Two-level TLAS traversal (world space at TLAS, view space at BLAS) ----
 // origin_view/dir_view are in view space (from the depth unproject + hemisphere sample).
 // The TLAS is in world space; ray is converted once at the top.
-// BLAS leaves still receive the original view-space ray via pnMtxInv (view→local).
+// BLAS leaves receive the world-space ray via worldToLocal (camera-independent).
 // After the TLAS, the dynamic GPU LBVH (skinned geo, view space) is checked as a second pass.
 // Returns 0=miss, 1=hit, 2=visit-limit reached.
 fn intersects_any(origin_view: vec3<f32>, dir_view: vec3<f32>, tmax: f32,
@@ -474,8 +474,8 @@ fn intersects_any(origin_view: vec3<f32>, dir_view: vec3<f32>, tmax: f32,
             }
             if (node.tri_count == 1u) {  // TLAS leaf
                 let inst = tlas_instances[node.tri_offset];
-                let l_origin = xf_point(inst, origin_view);
-                let l_dir    = xf_dir(inst, dir_view);
+                let l_origin = xf_point(inst, origin);
+                let l_dir    = xf_dir(inst, dir);
                 let r = traverse_blas(inst, l_origin, l_dir, tmax, acc_visits);
                 if (r == 1u) { *acc_visits += tlas_v; return 1u; }
                 if (r == 2u) { *acc_visits += tlas_v; return 2u; }
@@ -826,9 +826,9 @@ struct AcNode {
 }
 
 struct TlasInstance {
-    pnMtxInv_r0     : vec4<f32>,
-    pnMtxInv_r1     : vec4<f32>,
-    pnMtxInv_r2     : vec4<f32>,
+    wtl_r0     : vec4<f32>,
+    wtl_r1     : vec4<f32>,
+    wtl_r2     : vec4<f32>,
     blas_node_offset: u32,
     blas_tri_offset : u32,
     blas_node_count : u32,
@@ -914,14 +914,14 @@ fn xf_vtw_dir(d: vec3<f32>) -> vec3<f32> {
                      dot(cam.vtw_r2.xyz, d));
 }
 fn xf_point(inst: TlasInstance, p: vec3<f32>) -> vec3<f32> {
-    return vec3<f32>(dot(inst.pnMtxInv_r0, vec4<f32>(p, 1.0)),
-                     dot(inst.pnMtxInv_r1, vec4<f32>(p, 1.0)),
-                     dot(inst.pnMtxInv_r2, vec4<f32>(p, 1.0)));
+    return vec3<f32>(dot(inst.wtl_r0, vec4<f32>(p, 1.0)),
+                     dot(inst.wtl_r1, vec4<f32>(p, 1.0)),
+                     dot(inst.wtl_r2, vec4<f32>(p, 1.0)));
 }
 fn xf_dir(inst: TlasInstance, d: vec3<f32>) -> vec3<f32> {
-    return vec3<f32>(dot(inst.pnMtxInv_r0.xyz, d),
-                     dot(inst.pnMtxInv_r1.xyz, d),
-                     dot(inst.pnMtxInv_r2.xyz, d));
+    return vec3<f32>(dot(inst.wtl_r0.xyz, d),
+                     dot(inst.wtl_r1.xyz, d),
+                     dot(inst.wtl_r2.xyz, d));
 }
 
 // ---- AABB slab tests --------------------------------------------------------
@@ -1047,8 +1047,8 @@ fn intersects_any(origin_view: vec3<f32>, dir_view: vec3<f32>, tmax: f32,
             if (!aabb_hit(node, origin, inv_dir, tmax)) { idx = node.miss_next; continue; }
             if (node.tri_count == 1u) {
                 let inst     = tlas_instances[node.tri_offset];
-                let l_origin = xf_point(inst, origin_view);
-                let l_dir    = xf_dir(inst, dir_view);
+                let l_origin = xf_point(inst, origin);
+                let l_dir    = xf_dir(inst, dir);
                 let r = traverse_blas(inst, l_origin, l_dir, tmax, acc_visits);
                 if (r == 1u) { *acc_visits += tlas_v; return 1u; }
                 if (r == 2u) { *acc_visits += tlas_v; return 2u; }

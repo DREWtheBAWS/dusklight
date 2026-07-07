@@ -174,20 +174,25 @@ void TlasBuilder::build(const BlasCache& cache, const float viewMtx[4][4]) {
 
     // Compute view→world (invView) from the 3×4 affine portion of the view matrix.
     // Falls back to identity if the matrix is degenerate (e.g. not yet populated).
+    // view34 is kept for composing worldToLocal = pnMtxInv × view per instance,
+    // which makes the instance table camera-independent (no re-upload on camera motion).
     float invView[3][4] = { {1,0,0,0}, {0,1,0,0}, {0,0,1,0} };
-    {
-        const float v3x4[3][4] = {
-            {viewMtx[0][0], viewMtx[0][1], viewMtx[0][2], viewMtx[0][3]},
-            {viewMtx[1][0], viewMtx[1][1], viewMtx[1][2], viewMtx[1][3]},
-            {viewMtx[2][0], viewMtx[2][1], viewMtx[2][2], viewMtx[2][3]}
-        };
-        invert_3x4(v3x4, invView);  // ok to leave identity on failure
-    }
+    const float view34[3][4] = {
+        {viewMtx[0][0], viewMtx[0][1], viewMtx[0][2], viewMtx[0][3]},
+        {viewMtx[1][0], viewMtx[1][1], viewMtx[1][2], viewMtx[1][3]},
+        {viewMtx[2][0], viewMtx[2][1], viewMtx[2][2], viewMtx[2][3]}
+    };
+    invert_3x4(view34, invView);  // ok to leave identity on failure
 
     const auto& entries   = cache.entries();
     const auto& instances = cache.instances();
 
     // Rebuild/update the monolithic BLAS staging data when cache entries change.
+    // Captured BEFORE the repack block syncs m_lastBlasGeneration: on generation
+    // changes the fast path below must not run — an eviction repack moves every
+    // BLAS offset (stale offsets aim rays into the wrong geometry), and a newly
+    // built BLAS would never join the TLAS while the draw-list hash is stable.
+    const bool genChanged = (cache.generation() != m_lastBlasGeneration);
     if (cache.generation() != m_lastBlasGeneration) {
         const bool fullRebuild = (cache.eviction_generation() != m_lastEvictionGeneration);
         if (fullRebuild) {
@@ -241,13 +246,12 @@ void TlasBuilder::build(const BlasCache& cache, const float viewMtx[4][4]) {
     // ---------------------------------------------------------------------------
     // Fast path: when the draw-call list is identical to last frame (same blasKey
     // sequence, same count, no new/evicted BLASes), skip the full rebuild loop.
-    // Only update pnMtxInv per instance (needed for camera movement) and recompute
+    // Recompute worldToLocal per instance (cheap; keeps change detection exact) and recompute
     // worldAabb per instance to detect any moved objects.  Falls back to the slow
     // path if blasKey sequence changes or any instance is unmatchable.
     // ---------------------------------------------------------------------------
-    const bool genStable = (cache.generation() == m_lastBlasGeneration);
     bool fastPathOk = !m_forceRebuild
-                   && genStable
+                   && !genChanged
                    && instances.size() == m_lastCacheInstCount
                    && !m_instances.empty()
                    && m_instanceDrawIdx.size() == m_instances.size();
@@ -285,7 +289,12 @@ void TlasBuilder::build(const BlasCache& cache, const float viewMtx[4][4]) {
                 fastSahNeeded = true;
             }
 
-            invert_3x4(draw.pnMtx, m_instances[i].pnMtxInv);
+            float pnInv[3][4];
+            if (invert_3x4(draw.pnMtx, pnInv)) {
+                // world→local = (view→local) ∘ (world→view); camera-independent
+                // because pnMtx = model×view and the view factors cancel.
+                mat3x4_mul(pnInv, view34, m_instances[i].worldToLocal);
+            }
         }
     }
 
@@ -295,8 +304,8 @@ void TlasBuilder::build(const BlasCache& cache, const float viewMtx[4][4]) {
         {
             uint64_t h = uint64_t(m_instances.size()) * 0x9e3779b97f4a7c15ULL;
             for (const auto& ci : m_instances) {
-                const auto* b = reinterpret_cast<const uint8_t*>(ci.pnMtxInv);
-                for (size_t k = 0; k < sizeof(ci.pnMtxInv); k += 4) {
+                const auto* b = reinterpret_cast<const uint8_t*>(ci.worldToLocal);
+                for (size_t k = 0; k < sizeof(ci.worldToLocal); k += 4) {
                     uint32_t w = 0; std::memcpy(&w, b + k, 4);
                     h ^= uint64_t(w) * 2654435761ULL + (h << 6) + (h >> 2);
                 }
@@ -341,7 +350,10 @@ void TlasBuilder::build(const BlasCache& cache, const float viewMtx[4][4]) {
             if (!m_dedupSeen.insert(dh).second) { ++dedupRej; continue; }
 
             CpuInstance ci;
-            if (!invert_3x4(inst.pnMtx, ci.pnMtxInv)) continue;
+            float pnInv[3][4];
+            if (!invert_3x4(inst.pnMtx, pnInv)) continue;
+            // world→local = (view→local) ∘ (world→view) — camera-independent.
+            mat3x4_mul(pnInv, view34, ci.worldToLocal);
 
             float modelToWorld[3][4];
             mat3x4_mul(invView, inst.pnMtx, modelToWorld);
@@ -396,12 +408,12 @@ void TlasBuilder::build(const BlasCache& cache, const float viewMtx[4][4]) {
             m_lastStructHash = h;
         }
 
-        // Instance hash: pnMtxInv only (view-dependent).
+        // Instance hash: worldToLocal only (camera-independent, stable under camera motion).
         {
             uint64_t h = uint64_t(m_instances.size()) * 0x9e3779b97f4a7c15ULL;
             for (const auto& ci : m_instances) {
-                const auto* b = reinterpret_cast<const uint8_t*>(ci.pnMtxInv);
-                for (size_t k = 0; k < sizeof(ci.pnMtxInv); k += 4) {
+                const auto* b = reinterpret_cast<const uint8_t*>(ci.worldToLocal);
+                for (size_t k = 0; k < sizeof(ci.worldToLocal); k += 4) {
                     uint32_t w = 0; std::memcpy(&w, b + k, 4);
                     h ^= uint64_t(w) * 2654435761ULL + (h << 6) + (h >> 2);
                 }
@@ -443,7 +455,7 @@ void TlasBuilder::build(const BlasCache& cache, const float viewMtx[4][4]) {
         // Nodes dirty implies instance buffer must also be re-uploaded.
         m_tlasInstDirty = true;
     } else {
-        // Fast path but objects moved: m_instances already has correct worldAabb + pnMtxInv.
+        // Fast path but objects moved: m_instances already has correct worldAabb + worldToLocal.
         // Force a full SAH rebuild to update TLAS leaf positions.
         m_tlasNodesDirty = true;
         m_tlasInstDirty  = true;
@@ -550,7 +562,7 @@ void TlasBuilder::flush(WGPUDevice device) {
                 for (uint32_t i = 0; i < static_cast<uint32_t>(m_instances.size()); ++i) {
                     const CpuInstance& ci = m_instances[i];
                     GpuTlasInstance& gi = gpu[i];
-                    memcpy(gi.pnMtxInv, ci.pnMtxInv, sizeof(gi.pnMtxInv));
+                    memcpy(gi.worldToLocal, ci.worldToLocal, sizeof(gi.worldToLocal));
                     gi.blasNodeOffset = ci.blasNodeOffset;
                     gi.blasTriOffset  = ci.blasTriOffset;
                     gi.blasNodeCount  = ci.blasNodeCount;
@@ -571,7 +583,7 @@ void TlasBuilder::flush(WGPUDevice device) {
             }
         }
     } else if (m_tlasInstDirty) {
-        // Camera moved but world-space structure unchanged: update pnMtxInv in-place.
+        // Instance transforms changed but world-space structure unchanged: update in-place.
         // m_instances size is identical to the previous full-rebuild frame (structural hash
         // matched), so we can write directly into the existing buffer.
         if (!m_instances.empty()) {
@@ -579,7 +591,7 @@ void TlasBuilder::flush(WGPUDevice device) {
             for (uint32_t i = 0; i < static_cast<uint32_t>(m_instances.size()); ++i) {
                 const CpuInstance& ci = m_instances[i];
                 GpuTlasInstance& gi = gpu[i];
-                memcpy(gi.pnMtxInv, ci.pnMtxInv, sizeof(gi.pnMtxInv));
+                memcpy(gi.worldToLocal, ci.worldToLocal, sizeof(gi.worldToLocal));
                 gi.blasNodeOffset = ci.blasNodeOffset;
                 gi.blasTriOffset  = ci.blasTriOffset;
                 gi.blasNodeCount  = ci.blasNodeCount;
